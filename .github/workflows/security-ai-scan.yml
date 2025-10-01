@@ -1,5 +1,6 @@
-name: Security AI Scan (Semgrep + Heuristics + OpenAI)
+name: Security AI Scan (Semgrep only, stable)
 
+# 트리거: 수동/PR/Push 모두 지원
 on:
   workflow_dispatch:
   pull_request:
@@ -9,16 +10,14 @@ on:
 
 permissions:
   contents: read
-  pull-requests: write
   issues: write
+  pull-requests: write
 
 jobs:
-  ai-security-scan:
+  semgrep-scan:
     runs-on: ubuntu-latest
     env:
-      OPENAI_API_KEY: ${{ secrets.SKLEE_OPENAI_API_KEY }}
       MAX_FILE_BYTES: "150000"
-      MAX_DIFF_CHARS: "90000"
 
     steps:
       - name: Checkout repository
@@ -26,96 +25,7 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Collect changed files & diff
-        id: collect
-        uses: actions/github-script@v7
-        with:
-          script: |
-            const fs = require('fs');
-            const isPR = !!context.payload.pull_request;
-            let files = [];
-            let diff = '';
-
-            if (isPR) {
-              const prNumber = context.payload.pull_request.number;
-              const list = await github.rest.pulls.listFiles({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                pull_number: prNumber,
-                per_page: 500
-              });
-              files = list.data.map(function(f){ return f.filename; });
-
-              const diffResp = await github.request(
-                "GET /repos/{owner}/{repo}/pulls/{pull_number}",
-                {
-                  owner: context.repo.owner,
-                  repo: context.repo.repo,
-                  pull_number: prNumber,
-                  mediaType: { format: "diff" }
-                }
-              );
-              diff = diffResp.data || '';
-            } else {
-              const before = context.payload.before;
-              const after = context.payload.after;
-              if (before && after && before !== '0000000000000000000000000000000000000000') {
-                const comp = await github.rest.repos.compareCommits({
-                  owner: context.repo.owner,
-                  repo: context.repo.repo,
-                  base: before,
-                  head: after
-                });
-                files = (comp.data.files || []).map(function(f){ return f.filename; });
-                diff = (comp.data.files || []).map(function(f){
-                  return '--- ' + f.filename + "\n" + (f.patch || '[binary/no patch]') + "\n";
-                }).join("\n");
-              } else {
-                const tree = await github.rest.git.getTree({
-                  owner: context.repo.owner,
-                  repo: context.repo.repo,
-                  tree_sha: context.sha,
-                  recursive: "1"
-                }).catch(function(){ return {data:{tree:[]}}; });
-                files = (tree.data.tree || []).map(function(t){ return t.path; }).slice(0,300);
-                diff = '';
-              }
-            }
-
-            const maxChars = parseInt(process.env.MAX_DIFF_CHARS || '90000', 10);
-            if (diff && diff.length > maxChars) diff = diff.slice(0, maxChars) + "\n\n[...diff truncated]";
-
-            fs.writeFileSync('changed_files_list.txt', files.join('\n'));
-            fs.writeFileSync('changed_diff.txt', diff);
-            core.setOutput('files', files.join('\n'));
-            core.setOutput('diff', diff);
-
-      - name: Create semgrep custom rules file
-        run: |
-          cat > semgrep-custom.yml <<'EOF'
-rules:
-  - id: java-sqli-stmt-concat
-    languages: [java]
-    message: "Possible SQL injection: Statement.execute with string concatenation."
-    severity: ERROR
-    patterns:
-      - pattern-either:
-          - pattern: |
-              $ST = $CONN.createStatement();
-              $ST.execute($Q)
-          - pattern: |
-              $ST = $CONN.createStatement();
-              $ST.executeQuery($Q)
-      - pattern: $Q = $A + $B
-  - id: java-xss-getwriter
-    languages: [java]
-    message: "Possible XSS: writing user-controlled input to response without encoding."
-    severity: ERROR
-    patterns:
-      - pattern: response.getWriter().println($X)
-EOF
-
-      - name: Setup Python
+      - name: Setup Python 3.10
         uses: actions/setup-python@v4
         with:
           python-version: '3.10'
@@ -126,306 +36,108 @@ EOF
           pip install semgrep
           semgrep --version
 
+      - name: Write simple custom semgrep rules
+        run: |
+          cat > semgrep-custom.yml <<'EOF'
+rules:
+  - id: java-xss-detect
+    languages: [java]
+    message: "Possible XSS sink: writing to response without encoding"
+    severity: WARNING
+    patterns:
+      - pattern: response.getWriter().println($X)
+  - id: java-sql-concat
+    languages: [java]
+    message: "Possible SQL injection: query built via string concatenation"
+    severity: ERROR
+    patterns:
+      - pattern-either:
+          - pattern: |
+              Statement st = $CONN.createStatement();
+              st.execute($Q)
+          - pattern: |
+              Statement st = $CONN.createStatement();
+              st.executeQuery($Q)
+EOF
+
       - name: Run semgrep (built-in + custom)
         id: run_semgrep
         run: |
           semgrep --config p/ci --json --output semgrep-pci.json || true
           semgrep --config ./semgrep-custom.yml --json --output semgrep-custom.json || true
           python - <<'PY'
-import json
+import json,sys
 out = {"results": []}
 for fn in ("semgrep-pci.json","semgrep-custom.json"):
     try:
         j = json.load(open(fn))
         if isinstance(j.get("results"), list):
             out["results"].extend(j["results"])
-    except Exception:
+    except Exception as e:
         pass
 json.dump(out, open("semgrep-results.json","w"), indent=2)
-print("semgrep merged -> semgrep-results.json")
+print("Wrote semgrep-results.json")
 PY
 
-      - name: Choose files to analyze (semgrep flagged or changed)
-        id: choose_files
+      - name: Summarize semgrep results (short)
+        id: summarize
+        run: |
+          python - <<'PY'
+import json,sys
+try:
+    data = json.load(open('semgrep-results.json'))
+except Exception:
+    data = {"results": []}
+items = data.get("results", [])
+summary_lines = []
+for r in items[:200]:
+    path = r.get("path") or r.get("check_id") or "-"
+    start = "-"
+    try:
+        start = r.get("start", {}).get("line") or r.get("start", {}).get("line")
+    except Exception:
+        start = "-"
+    message = r.get("extra", {}).get("message") or r.get("message") or "-"
+    severity = r.get("extra", {}).get("severity") or r.get("check_id") or "-"
+    summary_lines.append(f"{path}:{start} [{severity}] {message}")
+out = "\n".join(summary_lines) if summary_lines else "No issues found by semgrep."
+open('semgrep-summary.txt','w',encoding='utf8').write(out)
+print("Summary written to semgrep-summary.txt")
+PY
+
+      - name: Post semgrep summary as PR comment or Issue
         uses: actions/github-script@v7
         with:
           script: |
             const fs = require('fs');
-            let flagged = new Set();
-            if (fs.existsSync('semgrep-results.json')) {
-              try {
-                const j = JSON.parse(fs.readFileSync('semgrep-results.json','utf8'));
-                (j.results || []).forEach(function(r){ if (r.path) flagged.add(r.path); });
-              } catch(e) {}
-            }
-            const changed = fs.existsSync('changed_files_list.txt') ? fs.readFileSync('changed_files_list.txt','utf8').split(/\r?\n/).filter(Boolean) : [];
-            if (flagged.size === 0) {
-              changed.forEach(function(f){ flagged.add(f); });
-            }
-            const arr = Array.from(flagged).slice(0,200);
-            fs.writeFileSync('files_to_analyze.json', JSON.stringify(arr, null, 2));
-            core.setOutput('count', arr.length.toString());
-
-      - name: Read files content (truncate)
-        id: read_contents
-        uses: actions/github-script@v7
-        with:
-          script: |
-            const fs = require('fs');
-            const list = fs.existsSync('files_to_analyze.json') ? JSON.parse(fs.readFileSync('files_to_analyze.json','utf8')) : [];
-            const MAX = parseInt(process.env.MAX_FILE_BYTES || '150000', 10);
-            const out = {};
-            list.forEach(function(f){
-              try {
-                if (fs.existsSync(f)) {
-                  let c = fs.readFileSync(f,'utf8');
-                  if (c.length > MAX) c = c.slice(0, MAX) + "\n\n[...truncated]";
-                  out[f] = c;
-                } else {
-                  out[f] = '[not checked out or binary]';
-                }
-              } catch(e) {
-                out[f] = "[error reading file: " + String(e) + "]";
-              }
-            });
-            fs.writeFileSync('files_content.json', JSON.stringify(out, null, 2));
-
-      - name: Heuristic scan (regex signals)
-        id: heuristics
-        uses: actions/github-script@v7
-        with:
-          script: |
-            const fs = require('fs');
-            const files = fs.existsSync('files_to_analyze.json') ? JSON.parse(fs.readFileSync('files_to_analyze.json','utf8')) : [];
-            const patterns = {
-              XSS_output_like: 'response.getWriter|getWriter\\(|println\\(',
-              XSS_replaceAll: '\\.replaceAll\\(',
-              SQL_concat_in_exec: 'execute(Query|Update)?\\(|execute\\).+\\+',
-              SQL_stmt: '\\bnew\\s+Statement\\b|\\bStatement\\b',
-              LDAP_usage: '\\b(InitialDirContext|DirContext|ldap|LDAP)\\b',
-              XPath_usage: '\\bXPath\\b|\\bevaluate\\('
-            };
-            const out = {};
-            files.forEach(function(f){
-              const hits = [];
-              try {
-                if (fs.existsSync(f)) {
-                  const lines = fs.readFileSync(f,'utf8').split(/\r?\n/);
-                  lines.forEach(function(line, idx){
-                    for (const k in patterns) {
-                      const re = new RegExp(patterns[k], 'i');
-                      if (re.test(line)) hits.push({line: idx+1, pattern: k, snippet: line.trim().slice(0,300)});
-                    }
-                  });
-                }
-              } catch(e) {
-                hits.push({error: String(e)});
-              }
-              out[f] = hits;
-            });
-            fs.writeFileSync('heuristics.json', JSON.stringify(out, null, 2));
-
-      - name: Call OpenAI for structured analysis
-        id: call_openai
-        uses: actions/github-script@v7
-        env:
-          OPENAI_API_KEY: ${{ env.OPENAI_API_KEY }}
-        with:
-          script: |
-            const fs = require('fs');
-            const apiKey = process.env.OPENAI_API_KEY || '';
-            const files = fs.existsSync('files_to_analyze.json') ? JSON.parse(fs.readFileSync('files_to_analyze.json','utf8')) : [];
-            const contents = fs.existsSync('files_content.json') ? JSON.parse(fs.readFileSync('files_content.json','utf8')) : {};
-            const heur = fs.existsSync('heuristics.json') ? JSON.parse(fs.readFileSync('heuristics.json','utf8')) : {};
-
-            const resultDefault = { overall: "None", items: [] };
-
-            if (!apiKey) {
-              fs.writeFileSync('ai_summary_structured.json', JSON.stringify({overall:"Unknown", note:"OPENAI_API_KEY missing"}, null, 2));
-              return;
-            }
-            if (files.length === 0) {
-              fs.writeFileSync('ai_summary_structured.json', JSON.stringify(resultDefault, null, 2));
-              return;
-            }
-
-            let fileListText = "Files:\n";
-            files.forEach(function(f){
-              const pr = (/(bad)/i).test(f) ? "HIGH" : "normal";
-              fileListText += "- " + f + " => " + pr + "\n";
-            });
-
-            let heurText = "Heuristic signals:\n";
-            Object.keys(heur).forEach(function(f){
-              const arr = heur[f] || [];
-              if (arr.length === 0) return;
-              heurText += f + ":\n";
-              arr.slice(0,6).forEach(function(h){
-                heurText += "  - line " + (h.line||"-") + " " + (h.pattern||"-") + " -> " + ((h.snippet||h.error||'').replace(/\r?\n/g,' ').slice(0,200)) + "\n";
-              });
-            });
-
-            let filesBlock = "";
-            files.forEach(function(f){
-              filesBlock += "--- " + f + " ---\n";
-              filesBlock += (contents[f] || '[not available]') + "\n\n";
-            });
-
-            const promptArr = [
-              "You are a precise security code reviewer. Return JSON only with structure:",
-              "{ overall: 'Block'|'Manual review'|'Low'|'None', items: [{file,line,severity,cwe,owasp,present,details_ko,recommendation_ko}] }",
-              "",
-              "PRIORITIZE files with filename containing 'bad' as HIGH.",
-              "",
-              "FILES LIST:",
-              fileListText,
-              "",
-              "HEURISTIC SIGNALS:",
-              heurText,
-              "",
-              "FILE CONTENTS (truncated):",
-              filesBlock,
-              "",
-              "Include CWE code and OWASP mapping if possible, and a short Korean remediation for each finding.",
-              "Return valid JSON only."
-            ];
-            const prompt = promptArr.join("\n\n");
-
-            const body = {
-              model: "gpt-4o-mini",
-              messages: [
-                { role: "system", content: "You are a concise, security-focused code reviewer. Produce JSON only." },
-                { role: "user", content: prompt }
-              ],
-              temperature: 0,
-              max_tokens: 1600
-            };
-
-            try {
-              const resp = await fetch("https://api.openai.com/v1/chat/completions", {
-                method: "POST",
-                headers: {
-                  "Authorization": "Bearer " + apiKey,
-                  "Content-Type": "application/json"
-                },
-                body: JSON.stringify(body)
-              });
-
-              if (!resp.ok) {
-                const t = await resp.text();
-                fs.writeFileSync('ai_summary_structured.json', JSON.stringify({ overall: "Unknown", note: "[OpenAI " + resp.status + "] " + t.slice(0,1000) }, null, 2));
-                return;
-              }
-
-              const j = await resp.json();
-              const text = j.choices && j.choices[0] && j.choices[0].message ? j.choices[0].message.content : '';
-              try {
-                const parsed = JSON.parse(text);
-                fs.writeFileSync('ai_summary_structured.json', JSON.stringify(parsed, null, 2));
-              } catch(e) {
-                // try to extract JSON block heuristically
-                const m = text.match(/\{[\s\S]*\}$/);
-                if (m) {
-                  try {
-                    fs.writeFileSync('ai_summary_structured.json', JSON.stringify(JSON.parse(m[0]), null, 2));
-                  } catch (e2) {
-                    fs.writeFileSync('ai_summary_structured.json', JSON.stringify({ overall:"Unknown", note:"parse error", raw: text.slice(0,1000) }, null, 2));
-                  }
-                } else {
-                  fs.writeFileSync('ai_summary_structured.json', JSON.stringify({ overall:"Unknown", note:"non-json returned", raw: text.slice(0,1000) }, null, 2));
-                }
-              }
-            } catch (err) {
-              fs.writeFileSync('ai_summary_structured.json', JSON.stringify({ overall:"Unknown", note: String(err) }, null, 2));
-            }
-
-      - name: Post result (PR comment or Issue)
-        if: always()
-        uses: actions/github-script@v7
-        with:
-          script: |
-            const fs = require('fs');
-            const heur = fs.existsSync('heuristics.json') ? JSON.parse(fs.readFileSync('heuristics.json','utf8')) : {};
-            const files = fs.existsSync('files_to_analyze.json') ? JSON.parse(fs.readFileSync('files_to_analyze.json','utf8')) : [];
-            let summary = { overall: "Unknown", items: [] };
-            if (fs.existsSync('ai_summary_structured.json')) {
-              try { summary = JSON.parse(fs.readFileSync('ai_summary_structured.json','utf8')); } catch(e) { summary = { overall: "Unknown", items: [], note: "parse error" }; }
-            }
-
-            const overallMap = { Block: "차단 필요", "Manual review": "수동 검토 필요", Low: "낮음", None: "취약점 없음" };
-            const overallKor = overallMap[summary.overall] || summary.overall || "알 수 없음";
-
-            const md = [];
-            md.push("### 🤖 AI Security Review (자동 보고)");
-            md.push("");
-            md.push("**전체 판단:** " + overallKor);
-            md.push("");
-            md.push("#### 분석 대상 파일 (우선순위)");
-            md.push("");
-            md.push("|파일|우선순위|");
-            md.push("|---|---|");
-            files.forEach(function(f){
-              const pr = (/(bad)/i).test(f) ? "HIGH" : "normal";
-              md.push("|" + f + "|" + pr + "|");
-            });
-            md.push("");
-            md.push("#### Heuristic 요약");
-            md.push("");
-            md.push("|파일|샘플 패턴|");
-            md.push("|---|---|");
-            Object.keys(heur).forEach(function(f){
-              const arr = heur[f] || [];
-              const sample = arr.slice(0,4).map(function(h){ return "L" + h.line + ":" + h.pattern; }).join("<br>") || "-";
-              md.push("|" + f + "|" + sample + "|");
-            });
-            md.push("");
-            md.push("#### 상세 결과");
-            md.push("");
-            if (!summary.items || summary.items.length === 0) {
-              md.push("_자동 분석 결과: 취약점 없음_");
-            } else {
-              md.push("|파일|라인|취약점|심각도|CWE|OWASP|요약(한국어)|권고(한국어)|");
-              md.push("|---|---:|---|---|---|---|---|---|");
-              summary.items.forEach(function(it){
-                const file = it.file || '-';
-                const line = it.line || '-';
-                const present = (it.present === false) ? '아님' : '있음';
-                const sev = it.severity || '-';
-                const cwe = it.cwe || '-';
-                const owasp = it.owasp || '-';
-                const desc = (it.details_ko || '-').replace(/\r?\n/g,' ');
-                const rec = (it.recommendation_ko || '-').replace(/\r?\n/g,' ');
-                md.push("|" + file + "|" + line + "|" + present + "|" + sev + "|" + cwe + "|" + owasp + "|" + desc + "|" + rec + "|");
-              });
-            }
-            md.push("");
-            md.push("> ※ 자동 보고입니다. '차단 필요' 항목은 담당자 검토 후 즉시 조치하세요.");
-            md.push("");
-            md.push("<details><summary>Raw artifacts</summary>");
-            md.push("");
-            md.push("```json");
-            if (fs.existsSync('heuristics.json')) md.push(fs.readFileSync('heuristics.json','utf8'));
-            md.push("");
-            md.push(fs.existsSync('ai_summary_structured.json') ? fs.readFileSync('ai_summary_structured.json','utf8') : '{}');
-            md.push("```");
-            md.push("</details>");
-            md.push("");
-            md.push("_자동 생성 — 담당자 검토 필수_");
-
-            const body = md.join("\n");
+            const body = fs.existsSync('semgrep-summary.txt') ? fs.readFileSync('semgrep-summary.txt','utf8') : "No summary.";
             const isPR = !!context.payload.pull_request;
+            const md = [];
+            md.push("### 🔎 Semgrep 자동 검사 결과");
+            md.push("");
+            md.push("```\n" + body + "\n```");
+            md.push("");
+            md.push("_자동 리포트 — 담당자 검토 필요_");
             if (isPR) {
               await github.rest.issues.createComment({
                 owner: context.repo.owner,
                 repo: context.repo.repo,
                 issue_number: context.payload.pull_request.number,
-                body
+                body: md.join("\n")
               });
             } else {
               await github.rest.issues.create({
                 owner: context.repo.owner,
                 repo: context.repo.repo,
-                title: "[AI Security Scan] 자동 리포트 - " + new Date().toISOString().slice(0,10),
-                body
+                title: `[Semgrep Scan] 자동 리포트 - ${new Date().toISOString().slice(0,10)}`,
+                body: md.join("\n")
               });
             }
+
+      - name: Upload semgrep results artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: semgrep-results
+          path: |
+            semgrep-results.json
+            semgrep-summary.txt
