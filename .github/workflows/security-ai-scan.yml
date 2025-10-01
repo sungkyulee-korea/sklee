@@ -1,4 +1,4 @@
-name: Security AI Scan (safe + detailed)
+name: Security AI Scan (debug + force-post)
 
 on:
   workflow_dispatch:
@@ -42,78 +42,121 @@ jobs:
           semgrep --config p/ci --json --output semgrep-results.json || true
           echo "semgrep finished, results saved to semgrep-results.json (if any)"
 
-      - name: Generate fallback report from semgrep (creates report.md)
-        uses: actions/github-script@v7
-        with:
-          script: |
-            const fs = require('fs');
-            const out = 'report.md';
-            let lines = [];
-            lines.push('### 자동 보안 리포트 (간단 요약)');
-            lines.push('');
-            if (fs.existsSync('semgrep-results.json')) {
-              let data = {};
-              try {
-                const txt = fs.readFileSync('semgrep-results.json','utf8');
-                data = JSON.parse(txt || '{}');
-              } catch(e) {
-                core.info('Failed to parse semgrep-results.json: ' + String(e));
-                data = {};
-              }
-              const results = Array.isArray(data.results) ? data.results : [];
-              if (results.length>0) {
-                lines.push('#### Semgrep 발견 항목:');
-                for (let i=0;i<Math.min(200,results.length);i++) {
-                  const r = results[i];
-                  const path = r.path || (r.extra && r.extra.metadata && r.extra.metadata.file) || '-';
-                  const extra = r.extra || {};
-                  const msg = extra.message || r.message || '';
-                  let start = '-';
-                  if (r.start && typeof r.start === 'object') start = r.start.line || '-';
-                  else if (r.start) start = String(r.start);
-                  const sev = extra.severity || '';
-                  lines.push(`- ${path}:${start} [${sev}] ${msg}`);
-                }
-              } else {
-                lines.push('- Semgrep: 문제 없음 (기본 룰).');
-              }
-            } else {
-              lines.push('- Semgrep 결과 파일(semgrep-results.json)이 없습니다.');
-            }
-            lines.push('');
-            lines.push('_자동 리포트 — 담당자 검토 필요_');
-            fs.writeFileSync(out, lines.join('\\n'), {encoding:'utf8'});
-            core.info('Fallback report.md created');
-
       - name: Run external security script (if present)
         id: run_script
         run: |
-          echo "Listing .github/scripts (if present):"
+          echo "----- START external security script step -----"
+          echo "Listing .github/scripts directory (if present):"
           ls -la .github/scripts || true
+
           if [ -f .github/scripts/security_scan.py ]; then
             echo "security_scan.py FOUND - running..."
-            python .github/scripts/security_scan.py
-            echo "security_scan.py finished with exit code $?"
+            python .github/scripts/security_scan.py || echo "security_scan.py exited with non-zero"
+            echo "security_scan.py finished"
           else
-            echo ".github/scripts/security_scan.py not found — using fallback report.md"
+            echo ".github/scripts/security_scan.py not found — relying on semgrep fallback report"
+            # Optionally generate a lightweight fallback report here (but we handle fallback in debug step)
           fi
 
-      - name: Post result (PR comment or create Issue on push)
+          # show files count and whether report.md exists (helpful quick check)
+          if [ -f report.md ]; then
+            echo "report.md created; files_count: 1"
+          else
+            echo "report.md NOT found at root"
+          fi
+
+          echo "----- END external security script step -----"
+
+      - name: Debug & Force-post report (show report and post truncated)
         uses: actions/github-script@v7
         with:
           script: |
             const fs = require('fs');
-            const path = 'report.md';
-            const body = fs.existsSync(path) ? fs.readFileSync(path,'utf8') : 'No report generated.';
+
+            // 1) Workspace inspection - helpful for debugging
+            core.info('=== WORKSPACE ===');
+            try {
+              const ls = require('child_process').execSync('ls -la', { encoding: 'utf8' });
+              core.info(ls);
+            } catch(e) {
+              core.info('ls failed: ' + String(e));
+            }
+
+            core.info('Listing .github/scripts (if exists):');
+            try {
+              const ls2 = require('child_process').execSync('ls -la .github/scripts || true', { encoding: 'utf8' });
+              core.info(ls2);
+            } catch(e) {
+              core.info('ls .github/scripts failed: ' + String(e));
+            }
+
+            // 2) If semgrep-results.json exists and report.md does not, create a simple report.md fallback
+            if (!fs.existsSync('report.md')) {
+              if (fs.existsSync('semgrep-results.json')) {
+                core.info('report.md not found, generating fallback report.md from semgrep-results.json');
+                try {
+                  const txt = fs.readFileSync('semgrep-results.json','utf8');
+                  const data = JSON.parse(txt || '{}');
+                  const results = Array.isArray(data.results) ? data.results : [];
+                  let lines = [];
+                  lines.push('### 자동 보안 리포트 (fallback from semgrep)');
+                  lines.push('');
+                  if (results.length > 0) {
+                    lines.push('#### Semgrep 발견 항목:');
+                    for (let i=0;i<Math.min(200,results.length);i++) {
+                      const r = results[i];
+                      const path = r.path || (r.extra && r.extra.metadata && r.extra.metadata.file) || '-';
+                      const extra = r.extra || {};
+                      const msg = extra.message || r.message || '';
+                      let start = '-';
+                      if (r.start && typeof r.start === 'object') start = r.start.line || '-';
+                      else if (r.start) start = String(r.start);
+                      const sev = extra.severity || '';
+                      lines.push(`- ${path}:${start} [${sev}] ${msg}`);
+                    }
+                  } else {
+                    lines.push('- Semgrep: 문제 없음 (기본 룰).');
+                  }
+                  lines.push('');
+                  lines.push('_자동 리포트 — 담당자 검토 필요_');
+                  fs.writeFileSync('report.md', lines.join('\\n'), {encoding:'utf8'});
+                  core.info('Fallback report.md created.');
+                } catch (e) {
+                  core.info('Failed to create fallback report: ' + String(e));
+                }
+              } else {
+                core.info('No semgrep-results.json and no report.md found.');
+              }
+            } else {
+              core.info('report.md already exists at workspace root.');
+            }
+
+            // 3) Show report.md existence and head content (for logs)
+            if (fs.existsSync('report.md')) {
+              const full = fs.readFileSync('report.md','utf8');
+              core.info('report.md size (chars): ' + full.length);
+              core.info('---- report.md head (first 4000 chars) ----');
+              core.info(full.slice(0,4000));
+              core.info('---- end head ----');
+            } else {
+              core.info('report.md STILL NOT found at workspace root after fallback attempts.');
+            }
+
+            // 4) Force post: if PR -> comment on PR; else -> create Issue
+            let body = fs.existsSync('report.md') ? fs.readFileSync('report.md','utf8') : 'No report generated.';
+            // truncate if too long
+            if (body.length > 8000) {
+              body = body.slice(0,8000) + '\n\n(리포트가 너무 길어 요약본만 게시되었습니다 - 전체는 artifact 참고)';
+            }
             const isPR = !!context.payload.pull_request;
             if (isPR) {
               await github.rest.issues.createComment({
                 owner: context.repo.owner,
                 repo: context.repo.repo,
                 issue_number: context.payload.pull_request.number,
-                body: `### 🤖 AI Security Review (자동 리포트)\n\n${body}\n\n_자동 생성 — 담당자 검토 필요_`
+                body: `### 🤖 AI Security Review (자동 리포트, 요약)\n\n${body}\n\n_자동 생성 — 담당자 검토 필요_`
               });
-              core.info('Posted report as PR comment');
+              core.info('Posted truncated report as PR comment');
             } else {
               await github.rest.issues.create({
                 owner: context.repo.owner,
@@ -121,7 +164,7 @@ jobs:
                 title: `[AI Security Scan] 자동 리포트 - ${new Date().toISOString().slice(0,10)}`,
                 body: `브랜치: ${context.ref}\n\n${body}\n\n_자동 생성 리포트_`
               });
-              core.info('Created issue with report');
+              core.info('Created issue with truncated report');
             }
 
       - name: Upload artifacts
@@ -130,8 +173,8 @@ jobs:
           name: security-scan-artifacts
           path: |
             semgrep-results.json
+            report.md
             files_to_analyze.json
             files_content.json
             heuristics.json
             ai_summary_structured.json
-            report.md
