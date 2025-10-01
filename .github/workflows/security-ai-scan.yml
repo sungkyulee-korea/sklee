@@ -9,8 +9,9 @@ on:
 
 permissions:
   contents: read
-  pull-requests: write    # PR에 코멘트 작성 권한 필요
-
+  pull-requests: write
+  issues: write
+  
 jobs:
   ai-security-scan:
     runs-on: ubuntu-latest
