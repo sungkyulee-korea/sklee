@@ -13,7 +13,6 @@ permissions:
   pull-requests: write
 
 env:
-  # Optional: add SKLEE_OPENAI_API_KEY in repo Secrets to enable OpenAI enrichment
   OPENAI_API_KEY: ${{ secrets.SKLEE_OPENAI_API_KEY }}
   MAX_FILE_BYTES: "150000"
   MAX_FILES_TO_ANALYZE: "200"
@@ -41,24 +40,76 @@ jobs:
       - name: Run semgrep (builtin rules)
         run: |
           semgrep --config p/ci --json --output semgrep-results.json || true
-          echo "semgrep finished"
+          echo "semgrep finished, results saved to semgrep-results.json (if any)"
 
       - name: Run external security script (if present)
+        id: run_script
         run: |
+          echo "----- START external security script step -----"
+          echo "Listing .github/scripts:"
+          ls -la .github/scripts || true
           if [ -f .github/scripts/security_scan.py ]; then
+            echo "security_scan.py FOUND - running..."
             python .github/scripts/security_scan.py
+            echo "security_scan.py finished with exit code $?"
           else
-            echo ".github/scripts/security_scan.py not found — skipping"
+            echo ".github/scripts/security_scan.py not found — generating fallback report from semgrep-results.json"
+            python - <<'PY'
+import json,sys,os
+sr='semgrep-results.json'
+out='report.md'
+try:
+    data = json.load(open(sr,'r',encoding='utf8')) if os.path.exists(sr) else {}
+    results = data.get('results',[]) if isinstance(data,dict) else []
+    lines=[]
+    lines.append("### 자동 보안 리포트 (간단 요약)")
+    lines.append("")
+    if results:
+        lines.append("#### Semgrep 발견 항목:")
+        for r in results[:200]:
+            path = r.get('path') or r.get('extra',{}).get('metadata',{}).get('file','-')
+            msg = r.get('extra',{}).get('message') or r.get('message') or ''
+            start = r.get('start',{}).get('line','-') if isinstance(r.get('start'),dict) else r.get('start','-')
+            sev = r.get('extra',{}).get('severity','') or ''
+            lines.append(f"- {path}:{start} [{sev}] {msg}")
+    else:
+        lines.append("- Semgrep: 문제 없음(기본 룰).")
+    lines.append("")
+    lines.append("_자동 리포트 — 담당자 검토 필요_")
+    open(out,'w',encoding='utf8').write('\n'.join(lines))
+    print('Fallback report.md created')
+except Exception as e:
+    print('Failed to create fallback report:', e)
+    sys.exit(0)
+PY
           fi
+          echo "----- END external security script step -----"
 
-      - name: Post report to PR (if pull_request)
-        if: github.event_name == 'pull_request'
-        uses: peter-evans/create-or-update-comment@v4
+      - name: Post result (PR comment or create Issue on push)
+        uses: actions/github-script@v7
         with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-          issue-number: ${{ github.event.pull_request.number }}
-          body-file: report.md
-          edit-mode: replace
+          script: |
+            const fs = require('fs');
+            const path = 'report.md';
+            const body = fs.existsSync(path) ? fs.readFileSync(path,'utf8') : 'No report generated.';
+            const isPR = !!context.payload.pull_request;
+            if (isPR) {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.payload.pull_request.number,
+                body: `### 🤖 AI Security Review (자동 리포트)\n\n${body}\n\n_자동 생성 — 담당자 검토 필요_`
+              });
+              core.info('Posted report as PR comment');
+            } else {
+              await github.rest.issues.create({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                title: `[AI Security Scan] 자동 리포트 - ${new Date().toISOString().slice(0,10)}`,
+                body: `브랜치: ${context.ref}\n\n${body}\n\n_자동 생성 리포트_`
+              });
+              core.info('Created issue with report');
+            }
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
@@ -71,3 +122,4 @@ jobs:
             heuristics.json
             ai_summary_structured.json
             report.md
+
