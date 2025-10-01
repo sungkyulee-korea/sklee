@@ -15,7 +15,6 @@ jobs:
   ai-security-scan:
     runs-on: ubuntu-latest
     env:
-      # ← 저장소 Settings > Secrets and variables > Actions 에 등록한 이름과 일치해야 합니다.
       OPENAI_API_KEY: ${{ secrets.SKLEE_OPENAI_API_KEY }}
       MAX_DIFF_CHARS: 90000
 
@@ -25,7 +24,6 @@ jobs:
         with:
           fetch-depth: 0
 
-      # 변경 파일/DIFF 추출 (안정적)
       - name: Get changed files & diff (PR or push)
         id: changed
         uses: actions/github-script@v7
@@ -34,7 +32,6 @@ jobs:
             const isPR = !!context.payload.pull_request;
             let diff = '';
             let files = [];
-
             if (isPR) {
               const prNumber = context.payload.pull_request.number;
               const list = await github.rest.pulls.listFiles({
@@ -44,7 +41,6 @@ jobs:
                 per_page: 100
               });
               files = list.data.map(f => f.filename);
-
               const diffResp = await github.request(
                 "GET /repos/{owner}/{repo}/pulls/{pull_number}",
                 {
@@ -58,7 +54,6 @@ jobs:
             } else {
               const before = context.payload.before;
               const after  = context.payload.after;
-
               if (before && after && before !== '0000000000000000000000000000000000000000') {
                 const comp = await github.rest.repos.compareCommits({
                   owner: context.repo.owner,
@@ -81,13 +76,11 @@ jobs:
                 diff = '';
               }
             }
-
             const maxChars = parseInt(process.env.MAX_DIFF_CHARS || '90000', 10);
             if (diff.length > maxChars) diff = diff.slice(0, maxChars) + "\n\n[...diff truncated]";
             core.setOutput("files", files.join("\n"));
             core.setOutput("diff", diff);
 
-      # OpenAI 호출을 JS에서 직접 수행(쉘/따옴표 문제 제거)
       - name: Call OpenAI via github-script (robust)
         id: call_openai
         uses: actions/github-script@v7
@@ -98,17 +91,15 @@ jobs:
         with:
           script: |
             const fs = require('fs');
-
             const files = process.env.FILES || '';
             const diff  = process.env.DIFF  || '';
             const apiKey = process.env.OPENAI_API_KEY || '';
-
             let out = '';
             if (!apiKey) {
               out = 'ERROR: OPENAI_API_KEY is empty';
             } else {
               const body = {
-                model: "gpt-4o-mini",   // 필요 시 다른 모델로 교체 가능
+                model: "gpt-4o-mini",
                 messages: [
                   { role: "system", content: "You are a concise, security-focused code reviewer." },
                   { role: "user", content:
@@ -122,7 +113,6 @@ jobs:
                 max_tokens: 1000,
                 temperature: 0
               };
-
               try {
                 const resp = await fetch("https://api.openai.com/v1/chat/completions", {
                   method: "POST",
@@ -132,7 +122,6 @@ jobs:
                   },
                   body: JSON.stringify(body)
                 });
-
                 if (resp.ok) {
                   const j = await resp.json();
                   out = (j.choices?.[0]?.message?.content) || "No summary generated.";
@@ -144,32 +133,94 @@ jobs:
                 out = 'Fetch failed: ' + String(e);
               }
             }
-
             fs.writeFileSync('ai_summary.txt', out);
 
-      # 결과를 PR 코멘트 또는 Issue로 게시
+      # 🔹 새로 추가: 한글 요약(조치 권고 포함) 생성
+      - name: Generate Korean Actionable Summary
+        if: ${{ always() }}
+        uses: actions/github-script@v7
+        env:
+          OPENAI_API_KEY: ${{ env.OPENAI_API_KEY }}
+        with:
+          script: |
+            const fs = require('fs');
+            const apiKey = process.env.OPENAI_API_KEY || '';
+            const english = fs.existsSync('ai_summary.txt')
+              ? fs.readFileSync('ai_summary.txt','utf8') : 'No summary.';
+            let ko = '';
+            if (!apiKey || english.startsWith('[OpenAI error') || english.startsWith('ERROR')) {
+              // API 오류면 간단한 규칙 기반 변환이라도 제공
+              ko = "⚠️ 한국어 요약을 생성하지 못했습니다.\n\n원문:\n" + english;
+            } else {
+              const body = {
+                model: "gpt-4o-mini",
+                messages: [
+                  { role: "system", content:
+                    "다음 보안 점검 결과를 한국어로 간결하게 요약하라. '조치 권고'를 불릿으로 정리하고, " +
+                    "파일:라인, 심각도(치명적/높음/보통/낮음)를 한국어로 표기하라. 8줄 이내." },
+                  { role: "user", content: english }
+                ],
+                max_tokens: 600,
+                temperature: 0
+              };
+              try {
+                const resp = await fetch("https://api.openai.com/v1/chat/completions", {
+                  method: "POST",
+                  headers: {
+                    "Authorization": `Bearer ${apiKey}`,
+                    "Content-Type": "application/json"
+                  },
+                  body: JSON.stringify(body)
+                });
+                if (resp.ok) {
+                  const j = await resp.json();
+                  ko = (j.choices?.[0]?.message?.content) || "한국어 요약 생성 실패.";
+                } else {
+                  const t = await resp.text();
+                  ko = `한국어 요약 생성 실패 [${resp.status}]\n` + t.slice(0, 2000) + "\n\n원문:\n" + english;
+                }
+              } catch (e) {
+                ko = '한국어 요약 생성 실패: ' + String(e) + "\n\n원문:\n" + english;
+              }
+            }
+            fs.writeFileSync('ai_summary_ko.txt', ko);
+
       - name: Post result (PR comment or Issue)
         uses: actions/github-script@v7
         with:
           script: |
             const fs = require('fs');
-            const body = fs.existsSync('ai_summary.txt')
-              ? fs.readFileSync('ai_summary.txt','utf8')
-              : 'No summary.';
+            const en = fs.existsSync('ai_summary.txt')  ? fs.readFileSync('ai_summary.txt','utf8')  : 'No summary.';
+            const ko = fs.existsSync('ai_summary_ko.txt')? fs.readFileSync('ai_summary_ko.txt','utf8'): '한국어 요약 없음.';
             const isPR = !!context.payload.pull_request;
+
+            const body = [
+              "### 🤖 AI Security Review",
+              "",
+              "**KOR 요약(조치 권고)**",
+              ko,
+              "",
+              "<details><summary>English original</summary>",
+              "",
+              en,
+              "",
+              "</details>",
+              "",
+              "_자동 생성 — 담당자 검토 필수_"
+            ].join("\n");
 
             if (isPR) {
               await github.rest.issues.createComment({
                 owner: context.repo.owner,
                 repo: context.repo.repo,
                 issue_number: context.payload.pull_request.number,
-                body: `### 🤖 AI Security Review (초안)\n\n${body}\n\n_자동 생성 — 담당자 검토 필수_`
+                body
               });
             } else {
               await github.rest.issues.create({
                 owner: context.repo.owner,
                 repo: context.repo.repo,
                 title: `[AI Security Scan] 자동 리포트 - ${new Date().toISOString().slice(0,10)}`,
-                body: `브랜치: ${context.ref}\n\n${body}\n\n_자동 생성 리포트_`
+                body: `브랜치: ${context.ref}\n\n${body}`
               });
             }
