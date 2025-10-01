@@ -1,4 +1,4 @@
-name: Security AI Scan (ChatGPT + Semgrep)
+name: Security AI Scan (ChatGPT + Semgrep CLI)
 
 on:
   workflow_dispatch:    # 수동 실행 가능
@@ -90,7 +90,7 @@ jobs:
 
       - name: Save changed files list
         run: |
-          echo "${{ steps.changed.outputs.files }}" > changed_files_list.txt
+          echo "${{ steps.changed.outputs.files }}" > changed_files_list.txt || true
           wc -l changed_files_list.txt || true
 
       - name: Read changed files contents (truncate large files)
@@ -119,14 +119,38 @@ jobs:
             fs.writeFileSync('changed_files_full.json', JSON.stringify(out, null, 2));
             core.setOutput('path','changed_files_full.json');
 
+      - name: Setup Python for semgrep
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+
+      - name: Install semgrep (pip)
+        run: |
+          python -m pip install --upgrade pip
+          pip install semgrep
+          semgrep --version
+
       - name: Run semgrep (policy-based static scan)
         id: semgrep
-        uses: returntocorp/semgrep-action@v2
-        with:
-          # 기본 CI rule pack 사용. 필요하면 custom repo or rules로 바꿀 것.
-          config: 'p/ci'
-          output: semgrep-results.json
-          format: json
+        run: |
+          # 기본 rule pack: p/ci (필요 시 조직 규칙으로 교체)
+          semgrep --config p/ci --json --output semgrep-results.json || true
+          if [ -f semgrep-results.json ]; then
+            echo "Semgrep results saved to semgrep-results.json"
+            # 요약 출력: result count
+            python - <<'PY'
+import json,sys
+try:
+  r=json.load(open('semgrep-results.json'))
+  n=len(r.get('results') or [])
+  print("Semgrep findings:", n)
+except Exception as e:
+  print("Could not parse semgrep results:", e)
+PY
+          else
+            echo "No semgrep output file found."
+          fi
+        shell: bash
 
       - name: Choose files flagged by semgrep (or fallback to changed files)
         id: chosen
@@ -139,7 +163,6 @@ jobs:
             if (fs.existsSync('semgrep-results.json')) {
               try {
                 const r = JSON.parse(fs.readFileSync('semgrep-results.json','utf8'));
-                // semgrep JSON "results" array with "path"
                 (r.results || []).forEach(item => {
                   if (item.path) flagged.add(item.path);
                 });
@@ -148,11 +171,10 @@ jobs:
               }
             }
             if (flagged.size === 0) {
-              // fallback: use the changed files list
               const list = fs.existsSync('changed_files_list.txt') ? fs.readFileSync('changed_files_list.txt','utf8').split(/\r?\n/).filter(Boolean) : [];
               list.forEach(f => flagged.add(f));
             }
-            const arr = Array.from(flagged).slice(0,100); // cap number of files
+            const arr = Array.from(flagged).slice(0,100);
             fs.writeFileSync('files_to_analyze.json', JSON.stringify(arr, null, 2));
             core.setOutput('path','files_to_analyze.json');
             core.setOutput('count', arr.length.toString());
@@ -175,23 +197,21 @@ jobs:
               return;
             }
 
-            // Build prompt: send each file content with clear instructions to return JSON list
-            let prompt = "You are a security code reviewer. For each file below, detect true vulnerabilities relevant to CWE/OWASP Top10. "
-                      + "Return a JSON object: { overall: 'Block'|'Manual review'|'Low'|'None', items:[{file,line,severity,cwe,owasp,present,details_ko,recommendation_ko}] }. "
-                      + "Only include items that are likely true vulnerabilities. Keep details_ko and recommendation_ko concise (1-2 sentences). Do not include raw code except filenames and line numbers.\n\n";
-
-            // Append file contents (only for relevant extensions)
-            for (const f of filesToAnalyze) {
-              const content = allFiles[f] || '[not available]';
-              // skip large binaries or placeholders
-              prompt += `--- ${f} ---\n`;
-              prompt += content + "\n\n";
-            }
-
-            // If nothing to analyze, write empty
             if (filesToAnalyze.length === 0) {
               fs.writeFileSync('ai_summary_structured.json', JSON.stringify(structured, null, 2));
               return;
+            }
+
+            // Build prompt by concatenating file contents (only text-based files)
+            let prompt = "You are a security code reviewer. For each file below, detect true vulnerabilities relevant to CWE and OWASP Top10. "
+                      + "Return a JSON object: { overall: 'Block'|'Manual review'|'Low'|'None', items:[{file,line,severity,cwe,owasp,present,details_ko,recommendation_ko}] }. "
+                      + "Only include items that are likely true vulnerabilities. Keep details_ko and recommendation_ko concise (1-2 sentences). Do not include raw code except filenames and line numbers.\n\n";
+
+            for (const f of filesToAnalyze) {
+              const content = allFiles[f] || '[not available]';
+              prompt += `--- ${f} ---\n`;
+              // Limit prompt length to avoid token overflow
+              prompt += (content.length > 120000 ? content.slice(0,120000) + "\n\n[...truncated]" : content) + "\n\n";
             }
 
             const body = {
@@ -217,7 +237,6 @@ jobs:
               if (resp.ok) {
                 const j = await resp.json();
                 const text = j.choices?.[0]?.message?.content || '';
-                // Try parse; if not JSON, attempt to extract JSON substring
                 try {
                   structured = JSON.parse(text);
                 } catch (e) {
@@ -249,7 +268,6 @@ jobs:
               catch { json = { overall: "Unknown", items: [], note: "parse error" }; }
             }
 
-            // Map overall to Korean
             const overallMap = { "Block":"차단 필요", "Manual review":"수동 검토 필요", "Low":"낮음", "None":"취약점 없음" };
             const overallKor = overallMap[json.overall] || json.overall || "알 수 없음";
 
