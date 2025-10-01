@@ -1,4 +1,4 @@
-name: Security AI Scan (debug + force-post)
+name: Security AI Scan (debug + force-post v2)
 
 on:
   workflow_dispatch:
@@ -55,10 +55,9 @@ jobs:
             echo "security_scan.py finished"
           else
             echo ".github/scripts/security_scan.py not found — relying on semgrep fallback report"
-            # Optionally generate a lightweight fallback report here (but we handle fallback in debug step)
           fi
 
-          # show files count and whether report.md exists (helpful quick check)
+          # quick check for report.md
           if [ -f report.md ]; then
             echo "report.md created; files_count: 1"
           else
@@ -69,31 +68,26 @@ jobs:
 
       - name: Debug & Force-post report (show report and post truncated)
         uses: actions/github-script@v7
+        # ensure token explicitly passed
         with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
           script: |
             const fs = require('fs');
+            const exec = require('child_process').execSync;
 
-            // 1) Workspace inspection - helpful for debugging
-            core.info('=== WORKSPACE ===');
-            try {
-              const ls = require('child_process').execSync('ls -la', { encoding: 'utf8' });
-              core.info(ls);
-            } catch(e) {
-              core.info('ls failed: ' + String(e));
-            }
+            core.info('=== WORKSPACE PWD ===');
+            try { core.info(exec('pwd').toString()); } catch(e){ core.info(String(e)); }
 
-            core.info('Listing .github/scripts (if exists):');
-            try {
-              const ls2 = require('child_process').execSync('ls -la .github/scripts || true', { encoding: 'utf8' });
-              core.info(ls2);
-            } catch(e) {
-              core.info('ls .github/scripts failed: ' + String(e));
-            }
+            core.info('=== LIST ROOT ===');
+            try { core.info(exec('ls -la').toString()); } catch(e){ core.info(String(e)); }
 
-            // 2) If semgrep-results.json exists and report.md does not, create a simple report.md fallback
+            core.info('=== LIST .github/scripts ===');
+            try { core.info(exec('ls -la .github/scripts || true').toString()); } catch(e){ core.info(String(e)); }
+
+            // If no report.md, try to generate fallback from semgrep-results.json
             if (!fs.existsSync('report.md')) {
+              core.info('report.md NOT found - attempting fallback creation from semgrep-results.json');
               if (fs.existsSync('semgrep-results.json')) {
-                core.info('report.md not found, generating fallback report.md from semgrep-results.json');
                 try {
                   const txt = fs.readFileSync('semgrep-results.json','utf8');
                   const data = JSON.parse(txt || '{}');
@@ -121,17 +115,17 @@ jobs:
                   lines.push('_자동 리포트 — 담당자 검토 필요_');
                   fs.writeFileSync('report.md', lines.join('\\n'), {encoding:'utf8'});
                   core.info('Fallback report.md created.');
-                } catch (e) {
-                  core.info('Failed to create fallback report: ' + String(e));
+                } catch(e) {
+                  core.info('Fallback creation failed: ' + String(e));
                 }
               } else {
-                core.info('No semgrep-results.json and no report.md found.');
+                core.info('No semgrep-results.json available for fallback.');
               }
             } else {
-              core.info('report.md already exists at workspace root.');
+              core.info('report.md already exists in workspace root.');
             }
 
-            // 3) Show report.md existence and head content (for logs)
+            // Show report.md head (for logs)
             if (fs.existsSync('report.md')) {
               const full = fs.readFileSync('report.md','utf8');
               core.info('report.md size (chars): ' + full.length);
@@ -142,29 +136,43 @@ jobs:
               core.info('report.md STILL NOT found at workspace root after fallback attempts.');
             }
 
-            // 4) Force post: if PR -> comment on PR; else -> create Issue
+            // Prepare body (truncate if too long)
             let body = fs.existsSync('report.md') ? fs.readFileSync('report.md','utf8') : 'No report generated.';
-            // truncate if too long
             if (body.length > 8000) {
               body = body.slice(0,8000) + '\n\n(리포트가 너무 길어 요약본만 게시되었습니다 - 전체는 artifact 참고)';
             }
+
+            // Make API call and print response for diagnostics
             const isPR = !!context.payload.pull_request;
-            if (isPR) {
-              await github.rest.issues.createComment({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                issue_number: context.payload.pull_request.number,
-                body: `### 🤖 AI Security Review (자동 리포트, 요약)\n\n${body}\n\n_자동 생성 — 담당자 검토 필요_`
-              });
-              core.info('Posted truncated report as PR comment');
-            } else {
-              await github.rest.issues.create({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                title: `[AI Security Scan] 자동 리포트 - ${new Date().toISOString().slice(0,10)}`,
-                body: `브랜치: ${context.ref}\n\n${body}\n\n_자동 생성 리포트_`
-              });
-              core.info('Created issue with truncated report');
+            try {
+              if (isPR) {
+                const issue_number = context.payload.pull_request.number;
+                core.info(`Posting comment to PR #${issue_number}...`);
+                const resp = await github.rest.issues.createComment({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number,
+                  body: `### 🤖 AI Security Review (자동 요약)\n\n${body}\n\n_자동 생성 — 담당자 검토 필요_`
+                });
+                core.info('API response status: ' + (resp.status || 'unknown'));
+                core.info('API response data (keys): ' + Object.keys(resp.data || {}).join(', '));
+                core.info('Posted truncated report as PR comment');
+              } else {
+                core.info('Creating Issue with report (push context)...');
+                const resp = await github.rest.issues.create({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  title: `[AI Security Scan] 자동 리포트 - ${new Date().toISOString().slice(0,10)}`,
+                  body: `브랜치: ${context.ref}\n\n${body}\n\n_자동 생성 리포트_`
+                });
+                core.info('API response status: ' + (resp.status || 'unknown'));
+                core.info('API response data (keys): ' + Object.keys(resp.data || {}).join(', '));
+                core.info('Created issue with truncated report');
+              }
+            } catch(e) {
+              core.info('API call failed: ' + String(e));
+              // try to extract helpful fields if possible
+              try { core.info('Error detail: ' + JSON.stringify(e, Object.getOwnPropertyNames(e))); } catch(e2) {}
             }
 
       - name: Upload artifacts
