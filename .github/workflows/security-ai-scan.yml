@@ -4,8 +4,7 @@ on:
   pull_request:
     types: [opened, synchronize, reopened]
   push:
-    branches:
-      - '**'
+    branches: ['**']
 
 permissions:
   contents: read
@@ -30,6 +29,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y jq
 
+      # 변경 파일/DIFF 추출 (JS는 github-script 안에서만 실행)
       - name: Get changed files & diff (PR or push)
         id: changed
         uses: actions/github-script@v7
@@ -42,42 +42,32 @@ jobs:
             if (isPR) {
               const prNumber = context.payload.pull_request.number;
               const list = await github.rest.pulls.listFiles({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                pull_number: prNumber,
-                per_page: 100
+                owner: context.repo.owner, repo: context.repo.repo,
+                pull_number: prNumber, per_page: 100
               });
               files = list.data.map(f => f.filename);
               const diffResp = await github.request(
                 "GET /repos/{owner}/{repo}/pulls/{pull_number}",
-                {
-                  owner: context.repo.owner,
-                  repo: context.repo.repo,
-                  pull_number: prNumber,
-                  mediaType: { format: "diff" }
-                }
+                { owner: context.repo.owner, repo: context.repo.repo,
+                  pull_number: prNumber, mediaType: { format: "diff" } }
               );
               diff = diffResp.data || '';
             } else {
               const before = context.payload.before;
-              const after = context.payload.after;
+              const after  = context.payload.after;
               if (before && after && before !== '0000000000000000000000000000000000000000') {
                 const comp = await github.rest.repos.compareCommits({
-                  owner: context.repo.owner,
-                  repo: context.repo.repo,
-                  base: before,
-                  head: after
+                  owner: context.repo.owner, repo: context.repo.repo,
+                  base: before, head: after
                 });
                 files = (comp.data.files || []).map(f => f.filename);
                 diff = (comp.data.files || []).map(f =>
-                  `--- ${f.filename}\n${f.patch || '[binary or no patch]' }\n`
+                  `--- ${f.filename}\n${f.patch || '[binary or no patch]'}\n`
                 ).join("\n");
               } else {
                 const tree = await github.rest.git.getTree({
-                  owner: context.repo.owner,
-                  repo: context.repo.repo,
-                  tree_sha: context.sha,
-                  recursive: "1"
+                  owner: context.repo.owner, repo: context.repo.repo,
+                  tree_sha: context.sha, recursive: "1"
                 }).catch(()=>({data:{tree:[]}}));
                 files = (tree.data.tree || []).map(t => t.path).slice(0, 100);
                 diff = '';
@@ -86,64 +76,93 @@ jobs:
 
             const maxChars = parseInt(process.env.MAX_DIFF_CHARS || '90000', 10);
             if (diff.length > maxChars) diff = diff.slice(0, maxChars) + "\n\n[...diff truncated]";
-
             core.setOutput("files", files.join("\n"));
             core.setOutput("diff", diff);
 
-      - name: Build OpenAI request JSON (safe)
+      # 여기는 "쉘"만 사용 (JS 금지). 파일로 안전하게 넘김
+      - name: Build OpenAI request JSON
+        shell: bash
         run: |
+          set -euo pipefail
           printf "%s" "${{ steps.changed.outputs.files }}" > files.txt
           printf "%s" "${{ steps.changed.outputs.diff }}"  > diff.txt
 
-          # jq로 요청 바디를 안전하게 구성 (YAML 따옴표 충돌 방지)
-          jq -n \
-            --arg files "$(cat files.txt)" \
-            --arg diff  "$(cat diff.txt)" \
-            '{
-              model: "gpt-4o-mini",
-              messages: [
-                { "role":"system", "content":"You are a concise, security-focused code reviewer."},
-                { "role":"user",
-                  "content": ("Analyze the code changes.\n\nFILES:\n" + $files + "\n\nDIFF:\n" + $diff)
-                }
-              ],
-              max_tokens: 1000,
-              temperature: 0
-            }' > request.json
+          # jq -Rs로 파일 내용을 "그대로" 읽어와 따옴표 충돌 제거
+          FILES=$(jq -Rs . < files.txt)
+          DIFF=$(jq -Rs . < diff.txt)
 
-      - name: Call OpenAI (ChatGPT) for security summary
+          jq -n --argjson files ${FILES} --argjson diff ${DIFF} '
+          {
+            model: "gpt-4o-mini",
+            messages: [
+              { "role":"system", "content":"You are a concise, security-focused code reviewer."},
+              { "role":"user",
+                "content":
+                  ("Analyze the code changes.\n\nFILES:\n" + $files +
+                   "\n\nDIFF:\n" + $diff +
+                   "\n\nRespond in Korean with:\n" +
+                   "Overall: (Block/Manual/Low)\n" +
+                   "Items: filename:line (severity) - short_desc - one-line fix")
+              }
+            ],
+            max_tokens: 1000,
+            temperature: 0
+          }' > request.json
+
+          echo "request.json bytes: $(wc -c < request.json)"
+
+      - name: Call OpenAI (tolerant; capture errors)
         id: call_openai
+        shell: bash
+        continue-on-error: true
         run: |
-          curl -sS https://api.openai.com/v1/chat/completions \
+          set -euo pipefail
+          if [ -z "${OPENAI_API_KEY:-}" ]; then
+            echo "ERROR: OPENAI_API_KEY empty" > ai_summary.txt
+            exit 0
+          fi
+
+          HTTP_CODE=$(curl -sS -o openai_response.json -w "%{http_code}" \
+            https://api.openai.com/v1/chat/completions \
             -H "Authorization: Bearer ${OPENAI_API_KEY}" \
             -H "Content-Type: application/json" \
-            -d @request.json > openai_response.json
+            --data-binary @request.json || echo "CURL_ERROR")
 
-          # 응답에서 요약만 추출 (없으면 빈 파일)
-          jq -r '.choices[0].message.content // empty' openai_response.json > ai_summary.txt || true
-          echo "---- AI SUMMARY (preview) ----"
-          head -n 50 ai_summary.txt || true
+          echo "HTTP_CODE=${HTTP_CODE}"
+          if [ "${HTTP_CODE}" = "CURL_ERROR" ]; then
+            echo "curl failed" > ai_summary.txt
+          elif [ "${HTTP_CODE}" -ge 200 ] && [ "${HTTP_CODE}" -lt 300 ]; then
+            jq -r '.choices[0].message.content // empty' openai_response.json > ai_summary.txt
+          else
+            {
+              echo "[OpenAI error ${HTTP_CODE}]"
+              echo "---- response (first 2KB) ----"
+              head -c 2000 openai_response.json
+            } > ai_summary.txt
+          fi
+          echo "---- SUMMARY PREVIEW ----"
+          head -n 60 ai_summary.txt || true
 
-      - name: Post result (comment on PR or create issue on push)
+      - name: Post result (PR comment or Issue)
         uses: actions/github-script@v7
         with:
           script: |
             const fs = require('fs');
-            const body = fs.existsSync('ai_summary.txt') ? fs.readFileSync('ai_summary.txt','utf8') : 'No summary generated.';
+            const body = fs.existsSync('ai_summary.txt')
+              ? fs.readFileSync('ai_summary.txt','utf8')
+              : 'No summary.';
             const isPR = !!context.payload.pull_request;
 
             if (isPR) {
               await github.rest.issues.createComment({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
+                owner: context.repo.owner, repo: context.repo.repo,
                 issue_number: context.payload.pull_request.number,
-                body: `### 🤖 AI Security Review (초안)\n\n${body}\n\n> _자동 생성 결과 — 담당자 검토 필요_`
+                body: `### 🤖 AI Security Review (디버그)\n\n${body}\n\n_자동 생성 결과 — 점검용_`
               });
             } else {
               await github.rest.issues.create({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                title: `[AI Security Scan] 자동 리포트 - ${new Date().toISOString().slice(0,10)}`,
-                body: `### 🤖 AI Security Review (push)\n\n브랜치: ${context.ref}\n\n${body}\n\n> _자동 생성 리포트_`
+                owner: context.repo.owner, repo: context.repo.repo,
+                title: `[AI Security Scan] 디버그 리포트 - ${new Date().toISOString().slice(0,10)}`,
+                body: `브랜치: ${context.ref}\n\n${body}\n\n_자동 생성 결과 — 점검용_`
               });
             }
