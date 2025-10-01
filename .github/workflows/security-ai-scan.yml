@@ -15,7 +15,7 @@ jobs:
   ai-security-scan:
     runs-on: ubuntu-latest
     env:
-      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      OPENAI_API_KEY: ${{ secrets.SKLEE_OPENAI_API_KEY }}
       MAX_DIFF_CHARS: 90000   # OpenAI에 보낼 최대 문자수 (조정 가능)
     steps:
       - name: Checkout code
