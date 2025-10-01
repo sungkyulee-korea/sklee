@@ -1,11 +1,11 @@
 name: Security AI Scan (ChatGPT + Semgrep CLI)
 
 on:
-  workflow_dispatch:    # 수동 실행 가능
+  workflow_dispatch:
   pull_request:
     types: [opened, synchronize, reopened]
   push:
-    branches: ['**']   # 필요 시 ['main']으로 제한
+    branches: ['**']
 
 permissions:
   contents: read
@@ -17,7 +17,7 @@ jobs:
     runs-on: ubuntu-latest
     env:
       OPENAI_API_KEY: ${{ secrets.SKLEE_OPENAI_API_KEY }}
-      MAX_FILE_BYTES: 150000    # 파일당 읽을 최대 바이트 (조정 가능)
+      MAX_FILE_BYTES: 150000
       MAX_DIFF_CHARS: 90000
 
     steps:
@@ -70,7 +70,6 @@ jobs:
                   `--- ${f.filename}\n${f.patch || '[binary/no patch]'}\n`
                 ).join("\n");
               } else {
-                // Fallback: list tree at commit
                 const tree = await github.rest.git.getTree({
                   owner: context.repo.owner,
                   repo: context.repo.repo,
@@ -99,7 +98,6 @@ jobs:
         with:
           script: |
             const fs = require('fs');
-            const core = require('@actions/core');
             const list = fs.existsSync('changed_files_list.txt') ? fs.readFileSync('changed_files_list.txt','utf8').split(/\r?\n/).filter(Boolean) : [];
             const maxBytes = parseInt(process.env.MAX_FILE_BYTES || '150000', 10);
             const out = {};
@@ -133,20 +131,13 @@ jobs:
       - name: Run semgrep (policy-based static scan)
         id: semgrep
         run: |
-          # 기본 rule pack: p/ci (필요 시 조직 규칙으로 교체)
           semgrep --config p/ci --json --output semgrep-results.json || true
           if [ -f semgrep-results.json ]; then
             echo "Semgrep results saved to semgrep-results.json"
-            # 요약 출력: result count
-            python - <<'PY'
-import json,sys
-try:
-  r=json.load(open('semgrep-results.json'))
-  n=len(r.get('results') or [])
-  print("Semgrep findings:", n)
-except Exception as e:
-  print("Could not parse semgrep results:", e)
-PY
+            # jq가 기본으로 설치되어 있으므로 결과 개수 출력
+            if command -v jq >/dev/null 2>&1; then
+              echo "Findings:" $(jq '.results | length' semgrep-results.json)
+            fi
           else
             echo "No semgrep output file found."
           fi
@@ -158,7 +149,6 @@ PY
         with:
           script: |
             const fs = require('fs');
-            const core = require('@actions/core');
             let flagged = new Set();
             if (fs.existsSync('semgrep-results.json')) {
               try {
@@ -166,9 +156,7 @@ PY
                 (r.results || []).forEach(item => {
                   if (item.path) flagged.add(item.path);
                 });
-              } catch(e) {
-                // parse error => ignore
-              }
+              } catch(e) {}
             }
             if (flagged.size === 0) {
               const list = fs.existsSync('changed_files_list.txt') ? fs.readFileSync('changed_files_list.txt','utf8').split(/\r?\n/).filter(Boolean) : [];
@@ -196,21 +184,18 @@ PY
               fs.writeFileSync('ai_summary_structured.json', JSON.stringify({overall:"Unknown", note:"OPENAI_API_KEY empty"}, null, 2));
               return;
             }
-
             if (filesToAnalyze.length === 0) {
               fs.writeFileSync('ai_summary_structured.json', JSON.stringify(structured, null, 2));
               return;
             }
 
-            // Build prompt by concatenating file contents (only text-based files)
-            let prompt = "You are a security code reviewer. For each file below, detect true vulnerabilities relevant to CWE and OWASP Top10. "
-                      + "Return a JSON object: { overall: 'Block'|'Manual review'|'Low'|'None', items:[{file,line,severity,cwe,owasp,present,details_ko,recommendation_ko}] }. "
-                      + "Only include items that are likely true vulnerabilities. Keep details_ko and recommendation_ko concise (1-2 sentences). Do not include raw code except filenames and line numbers.\n\n";
+            let prompt = "You are a security code reviewer. For each file below, detect true vulnerabilities relevant to CWE and OWASP Top10. ";
+            prompt += "Return a JSON object: { overall: 'Block'|'Manual review'|'Low'|'None', items:[{file,line,severity,cwe,owasp,present,details_ko,recommendation_ko}] }. ";
+            prompt += "Only include items that are likely true vulnerabilities. Keep details_ko and recommendation_ko concise (1-2 sentences). Do not include raw code except filenames and line numbers.\n\n";
 
             for (const f of filesToAnalyze) {
               const content = allFiles[f] || '[not available]';
               prompt += `--- ${f} ---\n`;
-              // Limit prompt length to avoid token overflow
               prompt += (content.length > 120000 ? content.slice(0,120000) + "\n\n[...truncated]" : content) + "\n\n";
             }
 
