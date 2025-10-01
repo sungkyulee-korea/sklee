@@ -5,66 +5,63 @@ on:
     types: [opened, synchronize, reopened]
   push:
     branches:
-      - '**'   # 모든 브랜치(필요시 main만 지정)
+      - '**'
 
 permissions:
   contents: read
   pull-requests: write
   issues: write
-  
+
 jobs:
   ai-security-scan:
     runs-on: ubuntu-latest
     env:
       OPENAI_API_KEY: ${{ secrets.SKLEE_OPENAI_API_KEY }}
-      MAX_DIFF_CHARS: 90000   # OpenAI에 보낼 최대 문자수 (조정 가능)
+      MAX_DIFF_CHARS: 90000
+
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - name: Determine changed files and diff
+      - name: Install jq
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq
+
+      - name: Get changed files & diff (PR or push)
         id: changed
         uses: actions/github-script@v7
         with:
           script: |
-            const context = github.context;
+            const isPR = !!context.payload.pull_request;
             let diff = '';
             let files = [];
-            if (context.payload.pull_request) {
-              // PR일 때: 변경 파일 목록과 unified diff
-              const pr = context.payload.pull_request;
+
+            if (isPR) {
+              const prNumber = context.payload.pull_request.number;
               const list = await github.rest.pulls.listFiles({
                 owner: context.repo.owner,
                 repo: context.repo.repo,
-                pull_number: pr.number,
+                pull_number: prNumber,
                 per_page: 100
               });
               files = list.data.map(f => f.filename);
-              // fetch raw diff from pull (mediaType format)
-              const diffResp = await github.request("GET /repos/{owner}/{repo}/pulls/{pull_number}", {
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                pull_number: pr.number,
-                mediaType: { format: "diff" }
-              });
-              diff = diffResp.data || '';
-            } else {
-              // push 이벤트일 때: compare commits base..head
-              const before = context.payload.before;
-              const after = context.payload.after;
-              if (!before || !after || before === '0000000000000000000000000000000000000000') {
-                // new branch or initial commit — fallback to list of files in head (not ideal)
-                const tree = await github.rest.git.getTree({
+              const diffResp = await github.request(
+                "GET /repos/{owner}/{repo}/pulls/{pull_number}",
+                {
                   owner: context.repo.owner,
                   repo: context.repo.repo,
-                  tree_sha: after,
-                  recursive: "1"
-                }).catch(()=>({data:{tree:[]}}));
-                files = tree.data.tree.map(t => t.path).slice(0,100);
-                diff = '';
-              } else {
+                  pull_number: prNumber,
+                  mediaType: { format: "diff" }
+                }
+              );
+              diff = diffResp.data || '';
+            } else {
+              const before = context.payload.before;
+              const after = context.payload.after;
+              if (before && after && before !== '0000000000000000000000000000000000000000') {
                 const comp = await github.rest.repos.compareCommits({
                   owner: context.repo.owner,
                   repo: context.repo.repo,
@@ -72,83 +69,81 @@ jobs:
                   head: after
                 });
                 files = (comp.data.files || []).map(f => f.filename);
-                // build simple diff from patch fields (may be null for binary files)
-                diff = (comp.data.files || []).map(f => {
-                  return `--- ${f.filename}\n${f.patch || '[binary or no patch available]'}\n`;
-                }).join("\n");
+                diff = (comp.data.files || []).map(f =>
+                  `--- ${f.filename}\n${f.patch || '[binary or no patch]' }\n`
+                ).join("\n");
+              } else {
+                const tree = await github.rest.git.getTree({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  tree_sha: context.sha,
+                  recursive: "1"
+                }).catch(()=>({data:{tree:[]}}));
+                files = (tree.data.tree || []).map(t => t.path).slice(0, 100);
+                diff = '';
               }
             }
-            // Truncate diff to safe size
-            const maxChars = parseInt(process.env.MAX_DIFF_CHARS || '90000');
-            if (diff.length > maxChars) diff = diff.slice(0, maxChars) + "\n\n[...diff truncated due to size limit]";
-            return { files: files.slice(0,200), diff };
 
-      - name: Save diff to file
+            const maxChars = parseInt(process.env.MAX_DIFF_CHARS || '90000', 10);
+            if (diff.length > maxChars) diff = diff.slice(0, maxChars) + "\n\n[...diff truncated]";
+
+            core.setOutput("files", files.join("\n"));
+            core.setOutput("diff", diff);
+
+      - name: Build OpenAI request JSON (safe)
         run: |
-          echo "${{ steps.changed.outputs.diff }}" > pr_diff.txt || true
-          echo "FILES<<EOF" > changed_files.txt
-          printf "%s\n" "${{ steps.changed.outputs.files }}" >> changed_files.txt
-          echo "EOF" >> changed_files.txt
+          printf "%s" "${{ steps.changed.outputs.files }}" > files.txt
+          printf "%s" "${{ steps.changed.outputs.diff }}"  > diff.txt
+
+          # jq로 요청 바디를 안전하게 구성 (YAML 따옴표 충돌 방지)
+          jq -n \
+            --arg files "$(cat files.txt)" \
+            --arg diff  "$(cat diff.txt)" \
+            '{
+              model: "gpt-4o-mini",
+              messages: [
+                { "role":"system", "content":"You are a concise, security-focused code reviewer."},
+                { "role":"user",
+                  "content": ("Analyze the code changes.\n\nFILES:\n" + $files + "\n\nDIFF:\n" + $diff)
+                }
+              ],
+              max_tokens: 1000,
+              temperature: 0
+            }' > request.json
 
       - name: Call OpenAI (ChatGPT) for security summary
         id: call_openai
         run: |
-          DIFF=$(head -c $MAX_DIFF_CHARS pr_diff.txt)
-          FILES=$(cat changed_files.txt)
-          # Prompt template: concise, structured output
-          read -r -d '' PROMPT <<'EOP'
-You are a security reviewer for code changes. Analyze the following git diff and changed file list. 
-1) For each likely security issue, output a single-line item: "filename:line (severity) - short description - suggested fix (one sentence)". 
-2) If binary or no patch available for a file, note "filename - binary/no patch".
-3) At the top, provide a short risk summary (max 2 sentences) and an overall recommended action: (Block / Manual review / Low priority).
-Only include items you have reasonable confidence about. If uncertain, mark as "Uncertain".
-Now analyze:
-FILES:
-$FILES
-
-DIFF:
-$DIFF
-EOP
-          # call OpenAI Chat Completions API (replace model if needed)
-          RESPONSE=$(curl -s -X POST "https://api.openai.com/v1/chat/completions" \
+          curl -sS https://api.openai.com/v1/chat/completions \
             -H "Authorization: Bearer ${OPENAI_API_KEY}" \
             -H "Content-Type: application/json" \
-            -d "$(jq -n --arg m "gpt-5-thinking-mini" --arg p "$PROMPT" '{
-              model: $m,
-              messages: [
-                {role:"system", content: "You are a concise, security-focused code reviewer."},
-                {role:"user", content: $p}
-              ],
-              max_tokens: 1000,
-              temperature: 0
-            }')"
-          )
-          echo "$RESPONSE" > openai_response.json || true
-          # extract assistant content
-          echo "$RESPONSE" | jq -r '.choices[0].message.content' > ai_summary.txt || true
-          echo "---- AI SUMMARY ----"
-          cat ai_summary.txt || true
+            -d @request.json > openai_response.json
 
-      - name: Post AI summary as PR comment (or create issue comment for push)
+          # 응답에서 요약만 추출 (없으면 빈 파일)
+          jq -r '.choices[0].message.content // empty' openai_response.json > ai_summary.txt || true
+          echo "---- AI SUMMARY (preview) ----"
+          head -n 50 ai_summary.txt || true
+
+      - name: Post result (comment on PR or create issue on push)
         uses: actions/github-script@v7
         with:
           script: |
             const fs = require('fs');
-            const body = fs.existsSync('ai_summary.txt') ? fs.readFileSync('ai_summary.txt','utf8') : 'No summary generated';
-            const context = github.context;
-            if (context.payload.pull_request) {
+            const body = fs.existsSync('ai_summary.txt') ? fs.readFileSync('ai_summary.txt','utf8') : 'No summary generated.';
+            const isPR = !!context.payload.pull_request;
+
+            if (isPR) {
               await github.rest.issues.createComment({
                 owner: context.repo.owner,
                 repo: context.repo.repo,
                 issue_number: context.payload.pull_request.number,
-                body: `### 🤖 AI Security Review (초안)\n\n${body}\n\n> _이 결과는 권고안입니다. 실제 반영 전 담당자 검토 필요._`
+                body: `### 🤖 AI Security Review (초안)\n\n${body}\n\n> _자동 생성 결과 — 담당자 검토 필요_`
               });
             } else {
-              // For push events, create an issue (or you can open a comment elsewhere)
               await github.rest.issues.create({
                 owner: context.repo.owner,
                 repo: context.repo.repo,
                 title: `[AI Security Scan] 자동 리포트 - ${new Date().toISOString().slice(0,10)}`,
-                body: `### 🤖 AI Security Review (push)\n\nBranches: ${context.ref}\n\n${body}\n\n> _자동 생성 리포트_`
+                body: `### 🤖 AI Security Review (push)\n\n브랜치: ${context.ref}\n\n${body}\n\n> _자동 생성 리포트_`
               });
             }
