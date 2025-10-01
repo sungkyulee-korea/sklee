@@ -1,4 +1,4 @@
-name: Security AI Scan (debug + force-post v2)
+name: Security AI Scan (debug + force-post v3)
 
 on:
   workflow_dispatch:
@@ -57,7 +57,6 @@ jobs:
             echo ".github/scripts/security_scan.py not found — relying on semgrep fallback report"
           fi
 
-          # quick check for report.md
           if [ -f report.md ]; then
             echo "report.md created; files_count: 1"
           else
@@ -68,21 +67,20 @@ jobs:
 
       - name: Debug & Force-post report (show report and post truncated)
         uses: actions/github-script@v7
-        # ensure token explicitly passed
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           script: |
             const fs = require('fs');
-            const exec = require('child_process').execSync;
+            const childExec = require('child_process').execSync;
 
             core.info('=== WORKSPACE PWD ===');
-            try { core.info(exec('pwd').toString()); } catch(e){ core.info(String(e)); }
+            try { core.info(childExec('pwd').toString()); } catch(e){ core.info(String(e)); }
 
             core.info('=== LIST ROOT ===');
-            try { core.info(exec('ls -la').toString()); } catch(e){ core.info(String(e)); }
+            try { core.info(childExec('ls -la').toString()); } catch(e){ core.info(String(e)); }
 
             core.info('=== LIST .github/scripts ===');
-            try { core.info(exec('ls -la .github/scripts || true').toString()); } catch(e){ core.info(String(e)); }
+            try { core.info(childExec('ls -la .github/scripts || true').toString()); } catch(e){ core.info(String(e)); }
 
             // If no report.md, try to generate fallback from semgrep-results.json
             if (!fs.existsSync('report.md')) {
@@ -171,7 +169,6 @@ jobs:
               }
             } catch(e) {
               core.info('API call failed: ' + String(e));
-              // try to extract helpful fields if possible
               try { core.info('Error detail: ' + JSON.stringify(e, Object.getOwnPropertyNames(e))); } catch(e2) {}
             }
 
