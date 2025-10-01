@@ -46,8 +46,9 @@ jobs:
         id: run_script
         run: |
           echo "----- START external security script step -----"
-          echo "Listing .github/scripts:"
+          echo "Listing .github/scripts directory (if present):"
           ls -la .github/scripts || true
+
           if [ -f .github/scripts/security_scan.py ]; then
             echo "security_scan.py FOUND - running..."
             python .github/scripts/security_scan.py
@@ -55,34 +56,47 @@ jobs:
           else
             echo ".github/scripts/security_scan.py not found — generating fallback report from semgrep-results.json"
             python - <<'PY'
-import json,sys,os
-sr='semgrep-results.json'
-out='report.md'
+import json, os, sys
+sr = 'semgrep-results.json'
+out = 'report.md'
+lines = []
 try:
-    data = json.load(open(sr,'r',encoding='utf8')) if os.path.exists(sr) else {}
-    results = data.get('results',[]) if isinstance(data,dict) else []
-    lines=[]
+    if os.path.exists(sr):
+        with open(sr, 'r', encoding='utf8') as f:
+            data = json.load(f)
+        results = data.get('results', []) if isinstance(data, dict) else []
+    else:
+        results = []
+
     lines.append("### 자동 보안 리포트 (간단 요약)")
     lines.append("")
     if results:
         lines.append("#### Semgrep 발견 항목:")
         for r in results[:200]:
-            path = r.get('path') or r.get('extra',{}).get('metadata',{}).get('file','-')
-            msg = r.get('extra',{}).get('message') or r.get('message') or ''
-            start = r.get('start',{}).get('line','-') if isinstance(r.get('start'),dict) else r.get('start','-')
-            sev = r.get('extra',{}).get('severity','') or ''
+            path = r.get('path') or r.get('extra', {}).get('metadata', {}).get('file', '-')
+            extra = r.get('extra', {})
+            msg = extra.get('message') or r.get('message') or ''
+            start = '-'
+            if isinstance(r.get('start'), dict):
+                start = r.get('start').get('line', '-')
+            else:
+                start = r.get('start', '-')
+            sev = extra.get('severity', '')
             lines.append(f"- {path}:{start} [{sev}] {msg}")
     else:
-        lines.append("- Semgrep: 문제 없음(기본 룰).")
+        lines.append("- Semgrep: 문제 없음 (기본 룰).")
+
     lines.append("")
     lines.append("_자동 리포트 — 담당자 검토 필요_")
-    open(out,'w',encoding='utf8').write('\n'.join(lines))
+    with open(out, 'w', encoding='utf8') as fw:
+        fw.write('\n'.join(lines))
     print('Fallback report.md created')
 except Exception as e:
     print('Failed to create fallback report:', e)
     sys.exit(0)
 PY
           fi
+
           echo "----- END external security script step -----"
 
       - name: Post result (PR comment or create Issue on push)
@@ -122,4 +136,3 @@ PY
             heuristics.json
             ai_summary_structured.json
             report.md
-
