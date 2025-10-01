@@ -26,7 +26,7 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Collect changed files list and diff
+      - name: Collect changed files & diff
         id: collect
         uses: actions/github-script@v7
         with:
@@ -44,7 +44,7 @@ jobs:
                 pull_number: prNumber,
                 per_page: 500
               });
-              files = list.data.map(f => f.filename);
+              files = list.data.map(function(f){ return f.filename; });
 
               const diffResp = await github.request(
                 "GET /repos/{owner}/{repo}/pulls/{pull_number}",
@@ -66,29 +66,31 @@ jobs:
                   base: before,
                   head: after
                 });
-                files = (comp.data.files || []).map(f => f.filename);
-                diff = (comp.data.files || []).map(f => `--- ${f.filename}\n${f.patch || '[binary/no patch]'}\n`).join("\n");
+                files = (comp.data.files || []).map(function(f){ return f.filename; });
+                diff = (comp.data.files || []).map(function(f){
+                  return '--- ' + f.filename + "\n" + (f.patch || '[binary/no patch]') + "\n";
+                }).join("\n");
               } else {
                 const tree = await github.rest.git.getTree({
                   owner: context.repo.owner,
                   repo: context.repo.repo,
                   tree_sha: context.sha,
                   recursive: "1"
-                }).catch(()=>({data:{tree:[]}}));
-                files = (tree.data.tree || []).map(t => t.path).slice(0,300);
+                }).catch(function(){ return {data:{tree:[]}}; });
+                files = (tree.data.tree || []).map(function(t){ return t.path; }).slice(0,300);
                 diff = '';
               }
             }
 
             const maxChars = parseInt(process.env.MAX_DIFF_CHARS || '90000', 10);
-            if (diff.length > maxChars) diff = diff.slice(0, maxChars) + "\n\n[...diff truncated]";
+            if (diff && diff.length > maxChars) diff = diff.slice(0, maxChars) + "\n\n[...diff truncated]";
 
             fs.writeFileSync('changed_files_list.txt', files.join('\n'));
             fs.writeFileSync('changed_diff.txt', diff);
             core.setOutput('files', files.join('\n'));
             core.setOutput('diff', diff);
 
-      - name: Create simple semgrep rules
+      - name: Create semgrep custom rules file
         run: |
           cat > semgrep-custom.yml <<'EOF'
 rules:
@@ -143,8 +145,8 @@ json.dump(out, open("semgrep-results.json","w"), indent=2)
 print("semgrep merged -> semgrep-results.json")
 PY
 
-      - name: Pick files to analyze (semgrep flagged or changed)
-        id: pick_files
+      - name: Choose files to analyze (semgrep flagged or changed)
+        id: choose_files
         uses: actions/github-script@v7
         with:
           script: |
@@ -153,16 +155,18 @@ PY
             if (fs.existsSync('semgrep-results.json')) {
               try {
                 const j = JSON.parse(fs.readFileSync('semgrep-results.json','utf8'));
-                (j.results || []).forEach(r => { if (r.path) flagged.add(r.path); });
+                (j.results || []).forEach(function(r){ if (r.path) flagged.add(r.path); });
               } catch(e) {}
             }
             const changed = fs.existsSync('changed_files_list.txt') ? fs.readFileSync('changed_files_list.txt','utf8').split(/\r?\n/).filter(Boolean) : [];
-            if (flagged.size === 0) changed.forEach(f => flagged.add(f));
+            if (flagged.size === 0) {
+              changed.forEach(function(f){ flagged.add(f); });
+            }
             const arr = Array.from(flagged).slice(0,200);
             fs.writeFileSync('files_to_analyze.json', JSON.stringify(arr, null, 2));
             core.setOutput('count', arr.length.toString());
 
-      - name: Read files to analyze content (truncate)
+      - name: Read files content (truncate)
         id: read_contents
         uses: actions/github-script@v7
         with:
@@ -171,7 +175,7 @@ PY
             const list = fs.existsSync('files_to_analyze.json') ? JSON.parse(fs.readFileSync('files_to_analyze.json','utf8')) : [];
             const MAX = parseInt(process.env.MAX_FILE_BYTES || '150000', 10);
             const out = {};
-            for (const f of list) {
+            list.forEach(function(f){
               try {
                 if (fs.existsSync(f)) {
                   let c = fs.readFileSync(f,'utf8');
@@ -181,12 +185,12 @@ PY
                   out[f] = '[not checked out or binary]';
                 }
               } catch(e) {
-                out[f] = `[error:${String(e)}]`;
+                out[f] = "[error reading file: " + String(e) + "]";
               }
-            }
+            });
             fs.writeFileSync('files_content.json', JSON.stringify(out, null, 2));
 
-      - name: Heuristic scan (regex)
+      - name: Heuristic scan (regex signals)
         id: heuristics
         uses: actions/github-script@v7
         with:
@@ -194,21 +198,22 @@ PY
             const fs = require('fs');
             const files = fs.existsSync('files_to_analyze.json') ? JSON.parse(fs.readFileSync('files_to_analyze.json','utf8')) : [];
             const patterns = {
-              XSS_output_like: /response\.getWriter|getWriter\(|println\(/i,
-              XSS_replaceAll: /\.replaceAll\(/i,
-              SQL_concat_in_exec: /execute(Query|Update)?\(|execute\).*\+/i,
-              SQL_stmt: /\bnew\s+Statement\b|\bStatement\b/i,
-              LDAP_usage: /\b(InitialDirContext|DirContext|ldap|LDAP)\b/i,
-              XPath_usage: /\bXPath\b|\bevaluate\(/i
+              XSS_output_like: 'response.getWriter|getWriter\\(|println\\(',
+              XSS_replaceAll: '\\.replaceAll\\(',
+              SQL_concat_in_exec: 'execute(Query|Update)?\\(|execute\\).+\\+',
+              SQL_stmt: '\\bnew\\s+Statement\\b|\\bStatement\\b',
+              LDAP_usage: '\\b(InitialDirContext|DirContext|ldap|LDAP)\\b',
+              XPath_usage: '\\bXPath\\b|\\bevaluate\\('
             };
-            const res = {};
-            for (const f of files) {
+            const out = {};
+            files.forEach(function(f){
               const hits = [];
               try {
                 if (fs.existsSync(f)) {
                   const lines = fs.readFileSync(f,'utf8').split(/\r?\n/);
-                  lines.forEach((line, idx) => {
-                    for (const [k,re] of Object.entries(patterns)) {
+                  lines.forEach(function(line, idx){
+                    for (const k in patterns) {
+                      const re = new RegExp(patterns[k], 'i');
                       if (re.test(line)) hits.push({line: idx+1, pattern: k, snippet: line.trim().slice(0,300)});
                     }
                   });
@@ -216,11 +221,11 @@ PY
               } catch(e) {
                 hits.push({error: String(e)});
               }
-              res[f] = hits;
-            }
-            fs.writeFileSync('heuristics.json', JSON.stringify(res, null, 2));
+              out[f] = hits;
+            });
+            fs.writeFileSync('heuristics.json', JSON.stringify(out, null, 2));
 
-      - name: Call OpenAI for structured JSON summary
+      - name: Call OpenAI for structured analysis
         id: call_openai
         uses: actions/github-script@v7
         env:
@@ -233,58 +238,63 @@ PY
             const contents = fs.existsSync('files_content.json') ? JSON.parse(fs.readFileSync('files_content.json','utf8')) : {};
             const heur = fs.existsSync('heuristics.json') ? JSON.parse(fs.readFileSync('heuristics.json','utf8')) : {};
 
-            let result = { overall: "None", items: [] };
+            const resultDefault = { overall: "None", items: [] };
 
             if (!apiKey) {
-              fs.writeFileSync('ai_summary_structured.json', JSON.stringify({overall:"Unknown", note:"OPENAI_API_KEY missing"}));
+              fs.writeFileSync('ai_summary_structured.json', JSON.stringify({overall:"Unknown", note:"OPENAI_API_KEY missing"}, null, 2));
               return;
             }
             if (files.length === 0) {
-              fs.writeFileSync('ai_summary_structured.json', JSON.stringify(result));
+              fs.writeFileSync('ai_summary_structured.json', JSON.stringify(resultDefault, null, 2));
               return;
             }
 
             let fileListText = "Files:\n";
-            for (const f of files) {
-              fileListText += `- ${f} (${/bad/i.test(f) ? "HIGH" : "normal"})\n`;
-            }
+            files.forEach(function(f){
+              const pr = (/(bad)/i).test(f) ? "HIGH" : "normal";
+              fileListText += "- " + f + " => " + pr + "\n";
+            });
 
-            let heurText = "Heuristic summary:\n";
-            for (const f of Object.keys(heur)) {
+            let heurText = "Heuristic signals:\n";
+            Object.keys(heur).forEach(function(f){
               const arr = heur[f] || [];
-              if (arr.length === 0) continue;
-              heurText += `${f}:\n`;
-              arr.slice(0,6).forEach(h => heurText += `  - line ${h.line||'-'} ${h.pattern||'-'} -> ${ (h.snippet||h.error||'').replace(/\r?\n/g,' ').slice(0,200)}\n`);
-            }
+              if (arr.length === 0) return;
+              heurText += f + ":\n";
+              arr.slice(0,6).forEach(function(h){
+                heurText += "  - line " + (h.line||"-") + " " + (h.pattern||"-") + " -> " + ((h.snippet||h.error||'').replace(/\r?\n/g,' ').slice(0,200)) + "\n";
+              });
+            });
 
             let filesBlock = "";
-            for (const f of files) {
-              filesBlock += `--- ${f} ---\n`;
+            files.forEach(function(f){
+              filesBlock += "--- " + f + " ---\n";
               filesBlock += (contents[f] || '[not available]') + "\n\n";
-            }
+            });
 
-            const prompt = [
+            const promptArr = [
               "You are a precise security code reviewer. Return JSON only with structure:",
               "{ overall: 'Block'|'Manual review'|'Low'|'None', items: [{file,line,severity,cwe,owasp,present,details_ko,recommendation_ko}] }",
               "",
-              "PRIORITIZE files whose filename contains 'bad' as HIGH.",
+              "PRIORITIZE files with filename containing 'bad' as HIGH.",
               "",
               "FILES LIST:",
               fileListText,
               "",
-              "HEURISTICS:",
+              "HEURISTIC SIGNALS:",
               heurText,
               "",
               "FILE CONTENTS (truncated):",
               filesBlock,
               "",
-              "For each item include CWE code and OWASP mapping if applicable and provide a one-line Korean remediation suggestion."
-            ].join("\n\n");
+              "Include CWE code and OWASP mapping if possible, and a short Korean remediation for each finding.",
+              "Return valid JSON only."
+            ];
+            const prompt = promptArr.join("\n\n");
 
             const body = {
               model: "gpt-4o-mini",
               messages: [
-                { role: "system", content: "You are a concise security-focused code reviewer. Produce JSON only." },
+                { role: "system", content: "You are a concise, security-focused code reviewer. Produce JSON only." },
                 { role: "user", content: prompt }
               ],
               temperature: 0,
@@ -295,7 +305,7 @@ PY
               const resp = await fetch("https://api.openai.com/v1/chat/completions", {
                 method: "POST",
                 headers: {
-                  "Authorization": `Bearer ${apiKey}`,
+                  "Authorization": "Bearer " + apiKey,
                   "Content-Type": "application/json"
                 },
                 body: JSON.stringify(body)
@@ -303,26 +313,30 @@ PY
 
               if (!resp.ok) {
                 const t = await resp.text();
-                fs.writeFileSync('ai_summary_structured.json', JSON.stringify({ overall: "Unknown", note: `[OpenAI ${resp.status}] ${t.slice(0,1000)}` }, null, 2));
+                fs.writeFileSync('ai_summary_structured.json', JSON.stringify({ overall: "Unknown", note: "[OpenAI " + resp.status + "] " + t.slice(0,1000) }, null, 2));
                 return;
               }
 
               const j = await resp.json();
-              const text = j.choices?.[0]?.message?.content || '';
+              const text = j.choices && j.choices[0] && j.choices[0].message ? j.choices[0].message.content : '';
               try {
-                result = JSON.parse(text);
-              } catch (e) {
-                // try to extract JSON block
+                const parsed = JSON.parse(text);
+                fs.writeFileSync('ai_summary_structured.json', JSON.stringify(parsed, null, 2));
+              } catch(e) {
+                // try to extract JSON block heuristically
                 const m = text.match(/\{[\s\S]*\}$/);
                 if (m) {
-                  try { result = JSON.parse(m[0]); } catch (e2) { result = { overall: "Unknown", note: "parse error", raw: text.slice(0,1000) }; }
+                  try {
+                    fs.writeFileSync('ai_summary_structured.json', JSON.stringify(JSON.parse(m[0]), null, 2));
+                  } catch (e2) {
+                    fs.writeFileSync('ai_summary_structured.json', JSON.stringify({ overall:"Unknown", note:"parse error", raw: text.slice(0,1000) }, null, 2));
+                  }
                 } else {
-                  result = { overall: "Unknown", note: "Non-JSON from model", raw: text.slice(0,1000) };
+                  fs.writeFileSync('ai_summary_structured.json', JSON.stringify({ overall:"Unknown", note:"non-json returned", raw: text.slice(0,1000) }, null, 2));
                 }
               }
-              fs.writeFileSync('ai_summary_structured.json', JSON.stringify(result, null, 2));
-            } catch (e) {
-              fs.writeFileSync('ai_summary_structured.json', JSON.stringify({ overall: "Unknown", note: String(e) }, null, 2));
+            } catch (err) {
+              fs.writeFileSync('ai_summary_structured.json', JSON.stringify({ overall:"Unknown", note: String(err) }, null, 2));
             }
 
       - name: Post result (PR comment or Issue)
@@ -335,7 +349,7 @@ PY
             const files = fs.existsSync('files_to_analyze.json') ? JSON.parse(fs.readFileSync('files_to_analyze.json','utf8')) : [];
             let summary = { overall: "Unknown", items: [] };
             if (fs.existsSync('ai_summary_structured.json')) {
-              try { summary = JSON.parse(fs.readFileSync('ai_summary_structured.json','utf8')); } catch(e) { summary = { overall: "Unknown", note: "parse error" }; }
+              try { summary = JSON.parse(fs.readFileSync('ai_summary_structured.json','utf8')); } catch(e) { summary = { overall: "Unknown", items: [], note: "parse error" }; }
             }
 
             const overallMap = { Block: "차단 필요", "Manual review": "수동 검토 필요", Low: "낮음", None: "취약점 없음" };
@@ -344,25 +358,25 @@ PY
             const md = [];
             md.push("### 🤖 AI Security Review (자동 보고)");
             md.push("");
-            md.push(`**전체 판단:** ${overallKor}`);
+            md.push("**전체 판단:** " + overallKor);
             md.push("");
             md.push("#### 분석 대상 파일 (우선순위)");
             md.push("");
             md.push("|파일|우선순위|");
             md.push("|---|---|");
-            files.forEach(f => {
-              const pr = /bad/i.test(f) ? "HIGH" : "normal";
-              md.push(`|${f}|${pr}|`);
+            files.forEach(function(f){
+              const pr = (/(bad)/i).test(f) ? "HIGH" : "normal";
+              md.push("|" + f + "|" + pr + "|");
             });
             md.push("");
             md.push("#### Heuristic 요약");
             md.push("");
             md.push("|파일|샘플 패턴|");
             md.push("|---|---|");
-            Object.keys(heur).forEach(f => {
+            Object.keys(heur).forEach(function(f){
               const arr = heur[f] || [];
-              const sample = arr.slice(0,4).map(h => `L${h.line}:${h.pattern}`).join("<br>") || "-";
-              md.push(`|${f}|${sample}|`);
+              const sample = arr.slice(0,4).map(function(h){ return "L" + h.line + ":" + h.pattern; }).join("<br>") || "-";
+              md.push("|" + f + "|" + sample + "|");
             });
             md.push("");
             md.push("#### 상세 결과");
@@ -372,7 +386,7 @@ PY
             } else {
               md.push("|파일|라인|취약점|심각도|CWE|OWASP|요약(한국어)|권고(한국어)|");
               md.push("|---|---:|---|---|---|---|---|---|");
-              summary.items.forEach(it => {
+              summary.items.forEach(function(it){
                 const file = it.file || '-';
                 const line = it.line || '-';
                 const present = (it.present === false) ? '아님' : '있음';
@@ -381,7 +395,7 @@ PY
                 const owasp = it.owasp || '-';
                 const desc = (it.details_ko || '-').replace(/\r?\n/g,' ');
                 const rec = (it.recommendation_ko || '-').replace(/\r?\n/g,' ');
-                md.push(`|${file}|${line}|${present}|${sev}|${cwe}|${owasp}|${desc}|${rec}|`);
+                md.push("|" + file + "|" + line + "|" + present + "|" + sev + "|" + cwe + "|" + owasp + "|" + desc + "|" + rec + "|");
               });
             }
             md.push("");
@@ -411,7 +425,7 @@ PY
               await github.rest.issues.create({
                 owner: context.repo.owner,
                 repo: context.repo.repo,
-                title: `[AI Security Scan] 자동 리포트 - ${new Date().toISOString().slice(0,10)}`,
+                title: "[AI Security Scan] 자동 리포트 - " + new Date().toISOString().slice(0,10),
                 body
               });
             }
