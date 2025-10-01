@@ -1,6 +1,5 @@
-name: Security AI Scan (Semgrep only, stable)
+name: Minimal Semgrep Scan (stable)
 
-# 트리거: 수동/PR/Push 모두 지원
 on:
   workflow_dispatch:
   pull_request:
@@ -10,20 +9,14 @@ on:
 
 permissions:
   contents: read
-  issues: write
-  pull-requests: write
 
 jobs:
   semgrep-scan:
     runs-on: ubuntu-latest
-    env:
-      MAX_FILE_BYTES: "150000"
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
 
       - name: Setup Python 3.10
         uses: actions/setup-python@v4
@@ -36,108 +29,11 @@ jobs:
           pip install semgrep
           semgrep --version
 
-      - name: Write simple custom semgrep rules
-        run: |
-          cat > semgrep-custom.yml <<'EOF'
-rules:
-  - id: java-xss-detect
-    languages: [java]
-    message: "Possible XSS sink: writing to response without encoding"
-    severity: WARNING
-    patterns:
-      - pattern: response.getWriter().println($X)
-  - id: java-sql-concat
-    languages: [java]
-    message: "Possible SQL injection: query built via string concatenation"
-    severity: ERROR
-    patterns:
-      - pattern-either:
-          - pattern: |
-              Statement st = $CONN.createStatement();
-              st.execute($Q)
-          - pattern: |
-              Statement st = $CONN.createStatement();
-              st.executeQuery($Q)
-EOF
+      - name: Run semgrep (built-in rules)
+        run: semgrep --config p/ci --json --output semgrep-results.json || true
 
-      - name: Run semgrep (built-in + custom)
-        id: run_semgrep
-        run: |
-          semgrep --config p/ci --json --output semgrep-pci.json || true
-          semgrep --config ./semgrep-custom.yml --json --output semgrep-custom.json || true
-          python - <<'PY'
-import json,sys
-out = {"results": []}
-for fn in ("semgrep-pci.json","semgrep-custom.json"):
-    try:
-        j = json.load(open(fn))
-        if isinstance(j.get("results"), list):
-            out["results"].extend(j["results"])
-    except Exception as e:
-        pass
-json.dump(out, open("semgrep-results.json","w"), indent=2)
-print("Wrote semgrep-results.json")
-PY
-
-      - name: Summarize semgrep results (short)
-        id: summarize
-        run: |
-          python - <<'PY'
-import json,sys
-try:
-    data = json.load(open('semgrep-results.json'))
-except Exception:
-    data = {"results": []}
-items = data.get("results", [])
-summary_lines = []
-for r in items[:200]:
-    path = r.get("path") or r.get("check_id") or "-"
-    start = "-"
-    try:
-        start = r.get("start", {}).get("line") or r.get("start", {}).get("line")
-    except Exception:
-        start = "-"
-    message = r.get("extra", {}).get("message") or r.get("message") or "-"
-    severity = r.get("extra", {}).get("severity") or r.get("check_id") or "-"
-    summary_lines.append(f"{path}:{start} [{severity}] {message}")
-out = "\n".join(summary_lines) if summary_lines else "No issues found by semgrep."
-open('semgrep-summary.txt','w',encoding='utf8').write(out)
-print("Summary written to semgrep-summary.txt")
-PY
-
-      - name: Post semgrep summary as PR comment or Issue
-        uses: actions/github-script@v7
-        with:
-          script: |
-            const fs = require('fs');
-            const body = fs.existsSync('semgrep-summary.txt') ? fs.readFileSync('semgrep-summary.txt','utf8') : "No summary.";
-            const isPR = !!context.payload.pull_request;
-            const md = [];
-            md.push("### 🔎 Semgrep 자동 검사 결과");
-            md.push("");
-            md.push("```\n" + body + "\n```");
-            md.push("");
-            md.push("_자동 리포트 — 담당자 검토 필요_");
-            if (isPR) {
-              await github.rest.issues.createComment({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                issue_number: context.payload.pull_request.number,
-                body: md.join("\n")
-              });
-            } else {
-              await github.rest.issues.create({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                title: `[Semgrep Scan] 자동 리포트 - ${new Date().toISOString().slice(0,10)}`,
-                body: md.join("\n")
-              });
-            }
-
-      - name: Upload semgrep results artifact
+      - name: Upload semgrep results
         uses: actions/upload-artifact@v4
         with:
           name: semgrep-results
-          path: |
-            semgrep-results.json
-            semgrep-summary.txt
+          path: semgrep-results.json
