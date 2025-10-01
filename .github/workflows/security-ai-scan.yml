@@ -1,11 +1,11 @@
-name: Security AI Scan (ChatGPT + Semgrep CLI)
+name: Security AI Scan (Semgrep + OpenAI)
 
 on:
   workflow_dispatch:
   pull_request:
     types: [opened, synchronize, reopened]
   push:
-    branches: ['**']
+    branches: ['**']   # 필요 시 ['main']으로 제한
 
 permissions:
   contents: read
@@ -111,7 +111,7 @@ jobs:
                   out[f] = '[file not checked out or binary]';
                 }
               } catch (e) {
-                out[f] = '[error reading file]';
+                out[f] = `[error reading file: ${String(e)}]`;
               }
             }
             fs.writeFileSync('changed_files_full.json', JSON.stringify(out, null, 2));
@@ -134,7 +134,6 @@ jobs:
           semgrep --config p/ci --json --output semgrep-results.json || true
           if [ -f semgrep-results.json ]; then
             echo "Semgrep results saved to semgrep-results.json"
-            # jq가 기본으로 설치되어 있으므로 결과 개수 출력
             if command -v jq >/dev/null 2>&1; then
               echo "Findings:" $(jq '.results | length' semgrep-results.json)
             fi
@@ -167,7 +166,48 @@ jobs:
             core.setOutput('path','files_to_analyze.json');
             core.setOutput('count', arr.length.toString());
 
-      - name: Call OpenAI for structured analysis (on files flagged)
+      - name: Heuristic pre-scan (regex signals)
+        id: heuristics
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const files = fs.existsSync('files_to_analyze.json') ? JSON.parse(fs.readFileSync('files_to_analyze.json','utf8')) : [];
+            const patterns = {
+              XSS_output_like: /(response\.getWriter|getWriter\(|println\()/i,
+              XSS_replaceAll: /\.replaceAll\(/i,
+              SQL_concat_in_exec: /(execute(Query|Update)?\(|execute\().*\+.*/i,
+              SQL_stmt: /\bnew\s+Statement\b|\bStatement\b/i,
+              SQL_prepare_concat: /prepareStatement\(.+\+/i,
+              LDAP_usage: /\b(InitialDirContext|DirContext|ldap|LDAP)\b/i,
+              XPath_usage: /\bXPath\b|\bevaluate\(/i,
+              File_read: /\bFileReader\b|\bBufferedReader\b|\breadLine\(/i
+            };
+            const out = {};
+            for (const f of files) {
+              const hits = [];
+              try {
+                if (fs.existsSync(f)) {
+                  const lines = fs.readFileSync(f,'utf8').split(/\r?\n/);
+                  lines.forEach((line, idx) => {
+                    for (const [k, re] of Object.entries(patterns)) {
+                      if (re.test(line)) {
+                        hits.push({ line: idx+1, pattern: k, snippet: line.trim().slice(0,300) });
+                      }
+                    }
+                  });
+                } else {
+                  // file not checked out / binary
+                }
+              } catch (e) {
+                hits.push({ error: String(e) });
+              }
+              out[f] = hits;
+            }
+            fs.writeFileSync('heuristics.json', JSON.stringify(out, null, 2), 'utf8');
+            core.setOutput('path','heuristics.json');
+
+      - name: Call OpenAI for structured analysis (with heuristics & file list)
         id: call_openai
         uses: actions/github-script@v7
         env:
@@ -176,37 +216,71 @@ jobs:
           script: |
             const fs = require('fs');
             const apiKey = process.env.OPENAI_API_KEY || '';
-            const filesToAnalyze = fs.existsSync('files_to_analyze.json') ? JSON.parse(fs.readFileSync('files_to_analyze.json','utf8')) : [];
+            const files = fs.existsSync('files_to_analyze.json') ? JSON.parse(fs.readFileSync('files_to_analyze.json','utf8')) : [];
             const allFiles = fs.existsSync('changed_files_full.json') ? JSON.parse(fs.readFileSync('changed_files_full.json','utf8')) : {};
+            const heur = fs.existsSync('heuristics.json') ? JSON.parse(fs.readFileSync('heuristics.json','utf8')) : {};
             let structured = { overall: "None", items: [] };
 
             if (!apiKey) {
-              fs.writeFileSync('ai_summary_structured.json', JSON.stringify({overall:"Unknown", note:"OPENAI_API_KEY empty"}, null, 2));
+              fs.writeFileSync('ai_summary_structured.json', JSON.stringify({overall:"Unknown", note:"OPENAI_API_KEY empty"}));
               return;
             }
-            if (filesToAnalyze.length === 0) {
-              fs.writeFileSync('ai_summary_structured.json', JSON.stringify(structured, null, 2));
+            if (files.length === 0) {
+              fs.writeFileSync('ai_summary_structured.json', JSON.stringify(structured));
               return;
             }
 
-            let prompt = "You are a security code reviewer. For each file below, detect true vulnerabilities relevant to CWE and OWASP Top10. ";
-            prompt += "Return a JSON object: { overall: 'Block'|'Manual review'|'Low'|'None', items:[{file,line,severity,cwe,owasp,present,details_ko,recommendation_ko}] }. ";
-            prompt += "Only include items that are likely true vulnerabilities. Keep details_ko and recommendation_ko concise (1-2 sentences). Do not include raw code except filenames and line numbers.\n\n";
-
-            for (const f of filesToAnalyze) {
-              const content = allFiles[f] || '[not available]';
-              prompt += `--- ${f} ---\n`;
-              prompt += (content.length > 120000 ? content.slice(0,120000) + "\n\n[...truncated]" : content) + "\n\n";
+            // Build file list + heuristics text
+            let fileListText = "Files to analyze (priority: filename containing 'bad' marked HIGH):\n";
+            for (const f of files) {
+              const priority = /bad/i.test(f) ? "HIGH" : "normal";
+              fileListText += `- ${f} => ${priority}\n`;
             }
+
+            let heurText = "Heuristic signals summary:\n";
+            for (const f of Object.keys(heur)) {
+              const arr = heur[f] || [];
+              if (arr.length === 0) continue;
+              heurText += `* ${f}:\n`;
+              arr.slice(0,8).forEach(h => {
+                heurText += `  - line ${h.line||'-'}: ${h.pattern||'-'} → ${(h.snippet||h.error||'').replace(/\r?\n/g,' ').slice(0,200)}\n`;
+              });
+            }
+
+            // Build limited contents block
+            let filesBlock = "";
+            for (const f of files) {
+              const c = allFiles[f] || "[not available]";
+              filesBlock += `--- ${f} ---\n`;
+              filesBlock += (c.length > 120000 ? c.slice(0,120000) + "\n\n[...truncated]" : c) + "\n\n";
+            }
+
+            const prompt = [
+              "You are a precise security code reviewer. For each file below, detect likely real vulnerabilities and map to CWE and OWASP Top10 if possible.",
+              "Return valid JSON only with structure: { overall: 'Block'|'Manual review'|'Low'|'None', items:[{file,line,severity,cwe,owasp,present,details_ko,recommendation_ko}] }.",
+              "Prioritize files marked HIGH (filename contains 'bad'). Only include items that are likely true vulnerabilities.",
+              "",
+              "FILES LIST:",
+              fileListText,
+              "",
+              "HEURISTIC SIGNALS:",
+              heurText,
+              "",
+              "FILE CONTENTS (truncated where needed):",
+              filesBlock,
+              "",
+              "For each vulnerability include CWE code, OWASP mapping if possible, 1-line mitigation suggestion, brief Korean explanation (1-2 sentences).",
+              "If no vulnerability for a file, include an item for that file with present:false and details_ko:'취약점 없음'.",
+            ].join("\n");
 
             const body = {
               model: "gpt-4o-mini",
               messages: [
-                { role: "system", content: "You are a concise, security-focused code reviewer. Map findings to CWE and OWASP Top10 when possible. Respond with valid JSON only." },
+                { role: "system", content: "You are a concise security-focused code reviewer. Produce JSON only." },
                 { role: "user", content: prompt }
               ],
               temperature: 0,
-              max_tokens: 1400
+              max_tokens: 1600
             };
 
             try {
@@ -227,9 +301,9 @@ jobs:
                 } catch (e) {
                   const m = text.match(/\{[\s\S]*\}$/);
                   if (m) {
-                    try { structured = JSON.parse(m[0]); } catch(e2) { structured = { overall: "Unknown", note: "parse error" }; }
+                    try { structured = JSON.parse(m[0]); } catch(e2) { structured = { overall: "Unknown", note: "parse error", raw: text.slice(0,800) }; }
                   } else {
-                    structured = { overall: "Unknown", note: "Model returned non-JSON. Raw: " + text.slice(0,800) };
+                    structured = { overall: "Unknown", note: "Non-JSON returned", raw: text.slice(0,800) };
                   }
                 }
               } else {
@@ -242,30 +316,54 @@ jobs:
 
             fs.writeFileSync('ai_summary_structured.json', JSON.stringify(structured, null, 2));
 
-      - name: Post structured Korean report (PR comment or Issue)
+      - name: Post structured Korean report (PR comment or Issue) including file list & heuristics
         uses: actions/github-script@v7
         with:
           script: |
             const fs = require('fs');
+            const heur = fs.existsSync('heuristics.json') ? JSON.parse(fs.readFileSync('heuristics.json','utf8')) : {};
+            const files = fs.existsSync('files_to_analyze.json') ? JSON.parse(fs.readFileSync('files_to_analyze.json','utf8')) : [];
             let json = { overall: "Unknown", items: [] };
             if (fs.existsSync('ai_summary_structured.json')) {
-              try { json = JSON.parse(fs.readFileSync('ai_summary_structured.json','utf8')); }
-              catch { json = { overall: "Unknown", items: [], note: "parse error" }; }
+              try { json = JSON.parse(fs.readFileSync('ai_summary_structured.json','utf8')); } catch(e) { json = { overall:"Unknown", items: [], note:"parse error" }; }
             }
 
             const overallMap = { "Block":"차단 필요", "Manual review":"수동 검토 필요", "Low":"낮음", "None":"취약점 없음" };
             const overallKor = overallMap[json.overall] || json.overall || "알 수 없음";
 
-            let md = [];
+            const md = [];
             md.push("### 🤖 AI Security Review (자동 보고)");
             md.push("");
             md.push(`**전체 판단:** ${overallKor}`);
             md.push("");
 
+            md.push("#### 분석 대상 파일 목록 (우선순위)");
+            md.push("");
+            md.push("|파일|우선순위|");
+            md.push("|---|---|");
+            files.forEach(f=>{
+              const pr = /bad/i.test(f) ? "HIGH (filename contains 'bad')" : "normal";
+              md.push(`|${f}|${pr}|`);
+            });
+            md.push("");
+
+            md.push("#### Heuristic 선검사 요약");
+            md.push("");
+            md.push("|파일|검출 패턴(샘플)|");
+            md.push("|---|---|");
+            Object.keys(heur).forEach(f=>{
+              const arr = heur[f] || [];
+              const summary = arr.slice(0,6).map(h=>`line ${h.line}:${h.pattern}`).join("<br>") || "-";
+              md.push(`|${f}|${summary}|`);
+            });
+            md.push("");
+
+            md.push("#### 상세 결과");
+            md.push("");
             if (!json.items || json.items.length === 0) {
               md.push("_취약점 없음 (자동 분석)_");
             } else {
-              md.push("|파일|라인|취약점|심각도|CWE|OWASP|문제 요약 (한국어)|권고 (한국어)|");
+              md.push("|파일|라인|취약점 존재|심각도|CWE|OWASP|요약(한국어)|권고(한국어)|");
               md.push("|---|---:|---|---|---|---|---|---|");
               json.items.forEach(it=>{
                 const file = it.file || '-';
@@ -274,28 +372,27 @@ jobs:
                 const sev = it.severity || '-';
                 const cwe = it.cwe || '-';
                 const owasp = it.owasp || '-';
-                const desc = (it.details_ko || it.short_desc || '-').replace(/\r?\n/g,' ');
+                const desc = (it.details_ko || '-').replace(/\r?\n/g,' ');
                 const rec = (it.recommendation_ko || '-').replace(/\r?\n/g,' ');
                 md.push(`|${file}|${line}|${present}|${sev}|${cwe}|${owasp}|${desc}|${rec}|`);
               });
             }
-
             md.push("");
             md.push("> ※ 자동 도구 결과입니다. '차단 필요' 또는 '치명적' 항목은 담당자가 즉시 수동 검토·조치하세요.");
             md.push("");
-            md.push("<details><summary>English original / raw structured JSON</summary>");
+            md.push("<details><summary>Raw artifacts (heuristics & structured JSON)</summary>");
             md.push("");
             md.push("```json");
+            if (fs.existsSync('heuristics.json')) md.push(fs.readFileSync('heuristics.json','utf8'));
+            md.push("");
             md.push(fs.existsSync('ai_summary_structured.json') ? fs.readFileSync('ai_summary_structured.json','utf8') : '{}');
             md.push("```");
-            md.push("");
             md.push("</details>");
             md.push("");
             md.push("_자동 생성 리포트 — 담당자 검토 필수_");
 
             const body = md.join("\n");
             const isPR = !!context.payload.pull_request;
-
             if (isPR) {
               await github.rest.issues.createComment({
                 owner: context.repo.owner,
