@@ -1,4 +1,4 @@
-name: Minimal Semgrep Scan (stable)
+name: Security AI Scan (Detailed Report)
 
 on:
   workflow_dispatch:
@@ -9,31 +9,423 @@ on:
 
 permissions:
   contents: read
+  issues: write
+  pull-requests: write
 
 jobs:
-  semgrep-scan:
+  security-scan:
     runs-on: ubuntu-latest
+    env:
+      OPENAI_API_KEY: ${{ secrets.SKLEE_OPENAI_API_KEY }}
+      MAX_FILE_BYTES: "150000"
+      MAX_FILES_TO_ANALYZE: "100"
 
     steps:
-      - name: Checkout repository
+      - name: Checkout repository (full)
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Setup Python 3.10
         uses: actions/setup-python@v4
         with:
           python-version: '3.10'
 
-      - name: Install semgrep
+      - name: Install tools (semgrep, requests)
         run: |
           python -m pip install --upgrade pip
-          pip install semgrep
-          semgrep --version
+          pip install semgrep requests
 
-      - name: Run semgrep (built-in rules)
-        run: semgrep --config p/ci --json --output semgrep-results.json || true
+      - name: Create semgrep custom rules
+        run: |
+          cat > semgrep-custom.yml <<'EOF'
+rules:
+  - id: java-sqli-stmt-concat
+    languages: [java]
+    message: "Possible SQL injection: Statement.execute with string concatenation."
+    severity: ERROR
+    patterns:
+      - pattern-either:
+          - pattern: |
+              $ST = $CONN.createStatement();
+              $ST.execute($Q)
+          - pattern: |
+              $ST = $CONN.createStatement();
+              $ST.executeQuery($Q)
+      - pattern: $Q = $A + $B
+  - id: java-xss-getwriter
+    languages: [java]
+    message: "Possible XSS: writing user-controlled input to response without encoding."
+    severity: ERROR
+    patterns:
+      - pattern: response.getWriter().println($X)
+EOF
 
-      - name: Upload semgrep results
+      - name: Run semgrep (builtin + custom)
+        id: run-semgrep
+        run: |
+          semgrep --config p/ci --json --output semgrep-pci.json || true
+          semgrep --config ./semgrep-custom.yml --json --output semgrep-custom.json || true
+          python - <<'PY'
+import json
+out = {"results": []}
+for fn in ("semgrep-pci.json","semgrep-custom.json"):
+    try:
+        j = json.load(open(fn))
+        if isinstance(j.get("results"), list):
+            out["results"].extend(j["results"])
+    except Exception:
+        pass
+json.dump(out, open("semgrep-results.json","w"), indent=2)
+print("semgrep merged -> semgrep-results.json")
+PY
+
+      - name: Gather changed files (PR or Push) and prepare contents
+        id: gather-files
+        run: |
+          python - <<'PY'
+import os, json, subprocess, requests, math
+event_path = os.environ.get('GITHUB_EVENT_PATH')
+repo = os.environ.get('GITHUB_REPOSITORY')  # owner/repo
+token = os.environ.get('GITHUB_TOKEN')
+max_files = int(os.environ.get('MAX_FILES_TO_ANALYZE', '100'))
+files = []
+
+# If pull_request event, call GitHub API to list PR files
+if event_path and os.path.exists(event_path):
+    ev = json.load(open(event_path,'r'))
+    if 'pull_request' in ev and ev['pull_request'] and ev['pull_request'].get('number'):
+        prnum = ev['pull_request']['number']
+        owner, repo_name = repo.split('/')
+        headers = {'Authorization': f'Bearer {token}', 'Accept': 'application/vnd.github+json'}
+        page = 1
+        while True:
+            url = f'https://api.github.com/repos/{owner}/{repo_name}/pulls/{prnum}/files?per_page=100&page={page}'
+            r = requests.get(url, headers=headers, timeout=30)
+            if r.status_code != 200:
+                break
+            arr = r.json()
+            if not arr:
+                break
+            for it in arr:
+                files.append(it.get('filename'))
+            if len(arr) < 100:
+                break
+            page += 1
+
+# Else if push, use before/after in event payload
+if not files and event_path and os.path.exists(event_path):
+    ev = json.load(open(event_path,'r'))
+    before = ev.get('before')
+    after = ev.get('after') or os.environ.get('GITHUB_SHA')
+    if before and after and before != after:
+        try:
+            out = subprocess.check_output(['git','diff','--name-only', before, after]).decode('utf8').splitlines()
+            files.extend(out)
+        except Exception:
+            pass
+
+# Fallback: list changed/staged files via git (or all repo files if empty)
+if not files:
+    try:
+        out = subprocess.check_output(['git','ls-files']).decode('utf8').splitlines()
+        files = out
+    except Exception:
+        files = []
+
+# Deduplicate & limit
+seen = []
+for f in files:
+    if f not in seen:
+        seen.append(f)
+files = [f for f in seen if f]  # remove empty
+files = files[:max_files]
+
+# Save list
+open('files_to_analyze.json','w',encoding='utf8').write(json.dumps(files, ensure_ascii=False, indent=2))
+# Save truncated contents
+MAX_BYTES = int(os.environ.get('MAX_FILE_BYTES', '150000'))
+contents = {}
+for f in files:
+    try:
+        if os.path.exists(f):
+            s = open(f,'r',encoding='utf8',errors='ignore').read()
+            if len(s) > MAX_BYTES:
+                s = s[:MAX_BYTES] + "\n\n[...truncated]"
+            contents[f] = s
+        else:
+            contents[f] = '[not checked out or binary]'
+    except Exception as e:
+        contents[f] = '[error reading: ' + str(e) + ']'
+
+open('files_content.json','w',encoding='utf8').write(json.dumps(contents, ensure_ascii=False, indent=2))
+print("Files to analyze count:", len(files))
+PY
+
+      - name: Heuristic scan (regex) over files_to_analyze
+        id: heuristic-scan
+        run: |
+          python - <<'PY'
+import json, re, sys, os
+files = json.load(open('files_to_analyze.json','r',encoding='utf8'))
+contents = json.load(open('files_content.json','r',encoding='utf8'))
+patterns = {
+  "XSS_output_like": re.compile(r"response\.getWriter|getWriter\(|println\(", re.I),
+  "XSS_replaceAll": re.compile(r"\.replaceAll\(", re.I),
+  "SQL_concat_in_exec": re.compile(r"execute(Query|Update)?\(|execute\).*\+", re.I),
+  "SQL_stmt": re.compile(r"\bnew\s+Statement\b|\bStatement\b", re.I),
+  "SQL_prepare_concat": re.compile(r"prepareStatement\(.+\+", re.I),
+  "LDAP_usage": re.compile(r"\b(InitialDirContext|DirContext|ldap|LDAP)\b", re.I),
+  "XPath_usage": re.compile(r"\bXPath\b|\bevaluate\(", re.I),
+  "File_read": re.compile(r"\bFileReader\b|\bBufferedReader\b|\breadLine\(", re.I)
+}
+out = {}
+for f in files:
+    hits = []
+    text = contents.get(f, "")
+    try:
+        for i, line in enumerate(text.splitlines(), start=1):
+            for name, pat in patterns.items():
+                if pat.search(line):
+                    hits.append({"line": i, "pattern": name, "snippet": line.strip()[:300]})
+    except Exception as e:
+        hits.append({"error": str(e)})
+    out[f] = hits
+open('heuristics.json','w',encoding='utf8').write(json.dumps(out, ensure_ascii=False, indent=2))
+print("Heuristic scan done")
+PY
+
+      - name: Build prompt and call OpenAI (structured JSON expected)
+        if: env.OPENAI_API_KEY != ''
+        id: openai-call
+        run: |
+          python - <<'PY'
+import os, json, textwrap, requests, sys
+OPENAI_KEY = os.environ.get('OPENAI_API_KEY') or os.environ.get('OPENAI_API_KEY')
+if not OPENAI_KEY:
+    print("No OPENAI_API_KEY provided; skipping OpenAI call.")
+    sys.exit(0)
+
+files = json.load(open('files_to_analyze.json','r',encoding='utf8'))
+contents = json.load(open('files_content.json','r',encoding='utf8'))
+heur = json.load(open('heuristics.json','r',encoding='utf8'))
+
+# Build file list text
+file_list_text = ""
+for f in files:
+    priority = "HIGH" if 'bad' in f.lower() else "normal"
+    file_list_text += f"- {f} => {priority}\n"
+
+heur_text = ""
+for f in heur:
+    arr = heur[f]
+    if not arr:
+        continue
+    heur_text += f"{f}:\n"
+    for h in arr[:6]:
+        heur_text += f"  - L{h.get('line','-')} {h.get('pattern','-')} -> {h.get('snippet', h.get('error',''))}\n"
+
+# Build files block (truncated per file content)
+files_block = ""
+for f in files:
+    c = contents.get(f, "[not available]")
+    if len(c) > 120000:
+        c = c[:120000] + "\n\n[...truncated]"
+    files_block += f"--- {f} ---\n{c}\n\n"
+
+# Prompt asking for structured JSON
+user_prompt = textwrap.dedent(f"""
+You are a precise security code reviewer. For the files and heuristics below, detect likely true vulnerabilities.
+Return JSON only with structure:
+{{ "overall": "Block"|"Manual review"|"Low"|"None",
+  "items": [
+    {{
+      "file": "<path>",
+      "line": <number or "-">,
+      "severity": "<Low|Medium|High|Critical>",
+      "cwe": "<CWE-### or -> if not applicable>",
+      "owasp": "<OWASP-A## or -> if not applicable>",
+      "present": true|false,
+      "details_ko": "<short Korean explanation>",
+      "recommendation_ko": "<short Korean remediation>"
+    }}
+  ]
+}}
+
+Files list:
+{file_list_text}
+
+Heuristic signals:
+{heur_text}
+
+File contents (truncated):
+{files_block}
+
+Rules:
+- Prioritize files with filename containing 'bad'.
+- Only include likely real vulnerabilities (avoid low-confidence noise).
+- Map to CWE and OWASP where possible.
+- Keep descriptions concise (1-2 sentences) in Korean.
+- If a file has no vulnerability, include an item with present:false and details_ko:'취약점 없음'.
+
+Respond ONLY with valid JSON.
+""")
+
+headers = {
+    "Authorization": f"Bearer {OPENAI_KEY}",
+    "Content-Type": "application/json"
+}
+body = {
+    "model": "gpt-4o-mini",
+    "messages": [
+        {"role":"system","content":"You are a concise, security-focused code reviewer. Produce JSON only."},
+        {"role":"user","content": user_prompt}
+    ],
+    "temperature": 0,
+    "max_tokens": 1400
+}
+
+resp = requests.post("https://api.openai.com/v1/chat/completions", headers=headers, json=body, timeout=120)
+if resp.status_code != 200:
+    open('ai_summary_structured.json','w',encoding='utf8').write(json.dumps({"overall":"Unknown","note":f"OpenAI {resp.status_code}", "raw": resp.text[:2000]}, ensure_ascii=False, indent=2))
+    print("OpenAI call failed:", resp.status_code)
+    sys.exit(0)
+
+data = resp.json()
+text = data.get("choices",[{}])[0].get("message",{}).get("content","")
+# Try to parse JSON from response
+import re
+m = re.search(r'(\{[\s\S]*\})\s*$', text.strip())
+if m:
+    try:
+        parsed = json.loads(m.group(1))
+        open('ai_summary_structured.json','w',encoding='utf8').write(json.dumps(parsed, ensure_ascii=False, indent=2))
+        print("ai_summary_structured.json written")
+    except Exception as e:
+        open('ai_summary_structured.json','w',encoding='utf8').write(json.dumps({"overall":"Unknown","note":"parse error","raw": text[:2000]}, ensure_ascii=False, indent=2))
+        print("parse error:", e)
+else:
+    open('ai_summary_structured.json','w',encoding='utf8').write(json.dumps({"overall":"Unknown","note":"no JSON in response","raw": text[:2000]}, ensure_ascii=False, indent=2))
+    print("No JSON block found in model response; saved raw.")
+PY
+
+      - name: Prepare Markdown report from structured JSON
+        id: prepare-report
+        run: |
+          python - <<'PY'
+import json, os, sys
+heur = json.load(open('heuristics.json','r',encoding='utf8')) if os.path.exists('heuristics.json') else {}
+files = json.load(open('files_to_analyze.json','r',encoding='utf8')) if os.path.exists('files_to_analyze.json') else []
+summary = json.load(open('ai_summary_structured.json','r',encoding='utf8')) if os.path.exists('ai_summary_structured.json') else {"overall":"Unknown","items":[]}
+
+overall_map = {"Block":"차단 필요","Manual review":"수동 검토 필요","Low":"낮음","None":"취약점 없음"}
+overall_kor = overall_map.get(summary.get('overall'), summary.get('overall','알 수 없음'))
+
+lines = []
+lines.append("### 🤖 AI Security Review (자동 보고)")
+lines.append("")
+lines.append(f"**전체 판단:** {overall_kor}")
+lines.append("")
+lines.append("#### 분석 대상 파일 (우선순위)")
+lines.append("")
+lines.append("|파일|우선순위|")
+lines.append("|---|---|")
+for f in files:
+    pr = "HIGH" if "bad" in f.lower() else "normal"
+    lines.append(f"|{f}|{pr}|")
+lines.append("")
+lines.append("#### Heuristic 선검사 요약")
+lines.append("")
+lines.append("|파일|샘플 패턴|")
+lines.append("|---|---|")
+for f in files:
+    arr = heur.get(f, [])
+    sample = ", ".join([f\"L{h.get('line','-')}:{h.get('pattern','-')}\" for h in arr[:4]]) or "-"
+    lines.append(f"|{f}|{sample}|")
+lines.append("")
+lines.append("#### 상세 결과")
+lines.append("")
+if not summary.get('items'):
+    lines.append("_자동 분석 결과: 취약점 없음_")
+else:
+    lines.append("|파일|라인|취약점 존재|심각도|CWE|OWASP|요약(한국어)|권고(한국어)|")
+    lines.append("|---|---:|---|---|---|---|---|---|")
+    for it in summary.get('items', []):
+        file = it.get('file','-')
+        line = it.get('line','-')
+        present = '아님' if it.get('present') is False else '있음'
+        sev = it.get('severity','-')
+        cwe = it.get('cwe','-')
+        owasp = it.get('owasp','-')
+        desc = (it.get('details_ko') or '-').replace('\n',' ')
+        rec = (it.get('recommendation_ko') or '-').replace('\n',' ')
+        lines.append(f"|{file}|{line}|{present}|{sev}|{cwe}|{owasp}|{desc}|{rec}|")
+lines.append("")
+lines.append("> ※ 자동 도구 결과입니다. '차단 필요' 항목은 담당자 검토 후 즉시 조치하세요.")
+lines.append("")
+# Raw artifacts
+lines.append("<details><summary>Raw artifacts (heuristics & structured JSON)</summary>")
+lines.append("")
+lines.append("```json")
+if os.path.exists('heuristics.json'):
+    lines.append(open('heuristics.json','r',encoding='utf8').read())
+else:
+    lines.append("{}")
+lines.append("")
+if os.path.exists('ai_summary_structured.json'):
+    lines.append(open('ai_summary_structured.json','r',encoding='utf8').read())
+else:
+    lines.append("{}")
+lines.append("```")
+lines.append("")
+lines.append("_자동 생성 리포트 — 담당자 검토 필수_")
+
+md = "\n".join(lines)
+open('report.md','w',encoding='utf8').write(md)
+print("report.md created")
+PY
+
+      - name: Post report as PR comment or Issue using GITHUB_TOKEN
+        if: always()
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          python - <<'PY'
+import os, json, requests
+event_path = os.environ.get('GITHUB_EVENT_PATH')
+repo = os.environ.get('GITHUB_REPOSITORY')
+token = os.environ.get('GITHUB_TOKEN')
+md = open('report.md','r',encoding='utf8').read()
+headers = {'Authorization': f'Bearer {token}', 'Accept': 'application/vnd.github+json'}
+# If PR event, post comment on PR; else create an issue
+posted = False
+if event_path and os.path.exists(event_path):
+    ev = json.load(open(event_path,'r'))
+    if 'pull_request' in ev and ev['pull_request'] and ev['pull_request'].get('number'):
+        prnum = ev['pull_request']['number']
+        owner, repo_name = repo.split('/')
+        url = f"https://api.github.com/repos/{owner}/{repo_name}/issues/{prnum}/comments"
+        r = requests.post(url, headers=headers, json={"body": md}, timeout=30)
+        print("Posted PR comment:", r.status_code)
+        posted = True
+if not posted:
+    owner, repo_name = repo.split('/')
+    url = f"https://api.github.com/repos/{owner}/{repo_name}/issues"
+    r = requests.post(url, headers=headers, json={"title":"[AI Security Scan] 자동 리포트", "body": md}, timeout=30)
+    print("Created issue:", r.status_code)
+PY
+
+      - name: Upload artifacts (semgrep, heuristics, ai summary, report)
         uses: actions/upload-artifact@v4
         with:
-          name: semgrep-results
-          path: semgrep-results.json
+          name: security-scan-artifacts
+          path: |
+            semgrep-results.json
+            semgrep-pci.json
+            semgrep-custom.json
+            heuristics.json
+            files_to_analyze.json
+            files_content.json
+            ai_summary_structured.json
+            report.md
+
