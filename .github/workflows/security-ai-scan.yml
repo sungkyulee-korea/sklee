@@ -42,62 +42,61 @@ jobs:
           semgrep --config p/ci --json --output semgrep-results.json || true
           echo "semgrep finished, results saved to semgrep-results.json (if any)"
 
+      - name: Generate fallback report from semgrep (creates report.md)
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const out = 'report.md';
+            let lines = [];
+            lines.push('### 자동 보안 리포트 (간단 요약)');
+            lines.push('');
+            if (fs.existsSync('semgrep-results.json')) {
+              let data = {};
+              try {
+                const txt = fs.readFileSync('semgrep-results.json','utf8');
+                data = JSON.parse(txt || '{}');
+              } catch(e) {
+                core.info('Failed to parse semgrep-results.json: ' + String(e));
+                data = {};
+              }
+              const results = Array.isArray(data.results) ? data.results : [];
+              if (results.length>0) {
+                lines.push('#### Semgrep 발견 항목:');
+                for (let i=0;i<Math.min(200,results.length);i++) {
+                  const r = results[i];
+                  const path = r.path || (r.extra && r.extra.metadata && r.extra.metadata.file) || '-';
+                  const extra = r.extra || {};
+                  const msg = extra.message || r.message || '';
+                  let start = '-';
+                  if (r.start && typeof r.start === 'object') start = r.start.line || '-';
+                  else if (r.start) start = String(r.start);
+                  const sev = extra.severity || '';
+                  lines.push(`- ${path}:${start} [${sev}] ${msg}`);
+                }
+              } else {
+                lines.push('- Semgrep: 문제 없음 (기본 룰).');
+              }
+            } else {
+              lines.push('- Semgrep 결과 파일(semgrep-results.json)이 없습니다.');
+            }
+            lines.push('');
+            lines.push('_자동 리포트 — 담당자 검토 필요_');
+            fs.writeFileSync(out, lines.join('\\n'), {encoding:'utf8'});
+            core.info('Fallback report.md created');
+
       - name: Run external security script (if present)
         id: run_script
         run: |
-          echo "----- START external security script step -----"
-          echo "Listing .github/scripts directory (if present):"
+          echo "Listing .github/scripts (if present):"
           ls -la .github/scripts || true
-
           if [ -f .github/scripts/security_scan.py ]; then
             echo "security_scan.py FOUND - running..."
             python .github/scripts/security_scan.py
             echo "security_scan.py finished with exit code $?"
           else
-            echo ".github/scripts/security_scan.py not found — generating fallback report from semgrep-results.json"
-            python - <<'PY'
-import json, os, sys
-sr = 'semgrep-results.json'
-out = 'report.md'
-lines = []
-try:
-    if os.path.exists(sr):
-        with open(sr, 'r', encoding='utf8') as f:
-            data = json.load(f)
-        results = data.get('results', []) if isinstance(data, dict) else []
-    else:
-        results = []
-
-    lines.append("### 자동 보안 리포트 (간단 요약)")
-    lines.append("")
-    if results:
-        lines.append("#### Semgrep 발견 항목:")
-        for r in results[:200]:
-            path = r.get('path') or r.get('extra', {}).get('metadata', {}).get('file', '-')
-            extra = r.get('extra', {})
-            msg = extra.get('message') or r.get('message') or ''
-            start = '-'
-            if isinstance(r.get('start'), dict):
-                start = r.get('start').get('line', '-')
-            else:
-                start = r.get('start', '-')
-            sev = extra.get('severity', '')
-            lines.append(f"- {path}:{start} [{sev}] {msg}")
-    else:
-        lines.append("- Semgrep: 문제 없음 (기본 룰).")
-
-    lines.append("")
-    lines.append("_자동 리포트 — 담당자 검토 필요_")
-    with open(out, 'w', encoding='utf8') as fw:
-        fw.write('\n'.join(lines))
-    print('Fallback report.md created')
-except Exception as e:
-    print('Failed to create fallback report:', e)
-    sys.exit(0)
-PY
+            echo ".github/scripts/security_scan.py not found — using fallback report.md"
           fi
-
-          echo "----- END external security script step -----"
 
       - name: Post result (PR comment or create Issue on push)
         uses: actions/github-script@v7
