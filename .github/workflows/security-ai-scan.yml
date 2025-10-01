@@ -1,10 +1,11 @@
-name: Security AI Scan (ChatGPT)
+name: Security AI Scan (ChatGPT + Semgrep)
 
 on:
+  workflow_dispatch:    # 수동 실행 가능
   pull_request:
     types: [opened, synchronize, reopened]
   push:
-    branches: ['**']   # 필요시 main만 ['main']
+    branches: ['**']   # 필요 시 ['main']으로 제한
 
 permissions:
   contents: read
@@ -16,6 +17,7 @@ jobs:
     runs-on: ubuntu-latest
     env:
       OPENAI_API_KEY: ${{ secrets.SKLEE_OPENAI_API_KEY }}
+      MAX_FILE_BYTES: 150000    # 파일당 읽을 최대 바이트 (조정 가능)
       MAX_DIFF_CHARS: 90000
 
     steps:
@@ -24,7 +26,6 @@ jobs:
         with:
           fetch-depth: 0
 
-      # 변경 파일/DIFF 추출
       - name: Get changed files & diff (PR or push)
         id: changed
         uses: actions/github-script@v7
@@ -40,7 +41,7 @@ jobs:
                 owner: context.repo.owner,
                 repo: context.repo.repo,
                 pull_number: prNumber,
-                per_page: 100
+                per_page: 300
               });
               files = list.data.map(f => f.filename);
 
@@ -57,7 +58,6 @@ jobs:
             } else {
               const before = context.payload.before;
               const after  = context.payload.after;
-
               if (before && after && before !== '0000000000000000000000000000000000000000') {
                 const comp = await github.rest.repos.compareCommits({
                   owner: context.repo.owner,
@@ -69,6 +69,16 @@ jobs:
                 diff = (comp.data.files || []).map(f =>
                   `--- ${f.filename}\n${f.patch || '[binary/no patch]'}\n`
                 ).join("\n");
+              } else {
+                // Fallback: list tree at commit
+                const tree = await github.rest.git.getTree({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  tree_sha: context.sha,
+                  recursive: "1"
+                }).catch(()=>({data:{tree:[]}}));
+                files = (tree.data.tree || []).map(t => t.path).slice(0, 300);
+                diff = '';
               }
             }
 
@@ -78,60 +88,157 @@ jobs:
             core.setOutput("files", files.join("\n"));
             core.setOutput("diff", diff);
 
-      # OpenAI 호출 → JSON 구조화 (CWE, OWASP, 설명, 권고 포함)
-      - name: Generate structured security report (CWE/OWASP)
-        id: structured
+      - name: Save changed files list
+        run: |
+          echo "${{ steps.changed.outputs.files }}" > changed_files_list.txt
+          wc -l changed_files_list.txt || true
+
+      - name: Read changed files contents (truncate large files)
+        id: read_files
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const core = require('@actions/core');
+            const list = fs.existsSync('changed_files_list.txt') ? fs.readFileSync('changed_files_list.txt','utf8').split(/\r?\n/).filter(Boolean) : [];
+            const maxBytes = parseInt(process.env.MAX_FILE_BYTES || '150000', 10);
+            const out = {};
+            for (const f of list) {
+              try {
+                if (fs.existsSync(f)) {
+                  let s = fs.readFileSync(f,'utf8');
+                  if (s.length > maxBytes) s = s.slice(0, maxBytes) + "\n\n[...truncated]";
+                  out[f] = s;
+                } else {
+                  out[f] = '[file not checked out or binary]';
+                }
+              } catch (e) {
+                out[f] = '[error reading file]';
+              }
+            }
+            fs.writeFileSync('changed_files_full.json', JSON.stringify(out, null, 2));
+            core.setOutput('path','changed_files_full.json');
+
+      - name: Run semgrep (policy-based static scan)
+        id: semgrep
+        uses: returntocorp/semgrep-action@v2
+        with:
+          # 기본 CI rule pack 사용. 필요하면 custom repo or rules로 바꿀 것.
+          config: 'p/ci'
+          output: semgrep-results.json
+          format: json
+
+      - name: Choose files flagged by semgrep (or fallback to changed files)
+        id: chosen
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const core = require('@actions/core');
+            let flagged = new Set();
+            if (fs.existsSync('semgrep-results.json')) {
+              try {
+                const r = JSON.parse(fs.readFileSync('semgrep-results.json','utf8'));
+                // semgrep JSON "results" array with "path"
+                (r.results || []).forEach(item => {
+                  if (item.path) flagged.add(item.path);
+                });
+              } catch(e) {
+                // parse error => ignore
+              }
+            }
+            if (flagged.size === 0) {
+              // fallback: use the changed files list
+              const list = fs.existsSync('changed_files_list.txt') ? fs.readFileSync('changed_files_list.txt','utf8').split(/\r?\n/).filter(Boolean) : [];
+              list.forEach(f => flagged.add(f));
+            }
+            const arr = Array.from(flagged).slice(0,100); // cap number of files
+            fs.writeFileSync('files_to_analyze.json', JSON.stringify(arr, null, 2));
+            core.setOutput('path','files_to_analyze.json');
+            core.setOutput('count', arr.length.toString());
+
+      - name: Call OpenAI for structured analysis (on files flagged)
+        id: call_openai
         uses: actions/github-script@v7
         env:
           OPENAI_API_KEY: ${{ env.OPENAI_API_KEY }}
         with:
           script: |
             const fs = require('fs');
-            const files = process.env.FILES || '';
-            const diff  = process.env.DIFF  || '';
             const apiKey = process.env.OPENAI_API_KEY || '';
+            const filesToAnalyze = fs.existsSync('files_to_analyze.json') ? JSON.parse(fs.readFileSync('files_to_analyze.json','utf8')) : [];
+            const allFiles = fs.existsSync('changed_files_full.json') ? JSON.parse(fs.readFileSync('changed_files_full.json','utf8')) : {};
+            let structured = { overall: "None", items: [] };
 
-            let structured = { overall: "Unknown", items: [] };
-
-            if (apiKey) {
-              const body = {
-                model: "gpt-4o-mini",
-                messages: [
-                  { role: "system", content:
-                    "You are a security code reviewer. Summarize vulnerabilities in JSON. " +
-                    "Fields: overall, items[{file,line,severity,cwe,owasp,present,details_ko,recommendation_ko}]. " +
-                    "overall ∈ {Block, Manual review, Low, None}. " +
-                    "details_ko = 간단한 한국어 문제 설명, recommendation_ko = 한국어 권고 조치." },
-                  { role: "user", content: "FILES:\n" + files + "\n\nDIFF:\n" + diff }
-                ],
-                max_tokens: 900,
-                temperature: 0
-              };
-
-              try {
-                const resp = await fetch("https://api.openai.com/v1/chat/completions", {
-                  method: "POST",
-                  headers: {
-                    "Authorization": `Bearer ${apiKey}`,
-                    "Content-Type": "application/json"
-                  },
-                  body: JSON.stringify(body)
-                });
-                if (resp.ok) {
-                  const j = await resp.json();
-                  try { structured = JSON.parse(j.choices[0].message.content); }
-                  catch { structured = { overall: "Unknown", note: "JSON parse error" }; }
-                }
-              } catch (e) {
-                structured = { overall: "Unknown", note: "Fetch failed" };
-              }
+            if (!apiKey) {
+              fs.writeFileSync('ai_summary_structured.json', JSON.stringify({overall:"Unknown", note:"OPENAI_API_KEY empty"}, null, 2));
+              return;
             }
 
-            fs.writeFileSync('ai_summary_structured.json', JSON.stringify(structured,null,2));
-            core.setOutput("structured_path", "ai_summary_structured.json");
+            // Build prompt: send each file content with clear instructions to return JSON list
+            let prompt = "You are a security code reviewer. For each file below, detect true vulnerabilities relevant to CWE/OWASP Top10. "
+                      + "Return a JSON object: { overall: 'Block'|'Manual review'|'Low'|'None', items:[{file,line,severity,cwe,owasp,present,details_ko,recommendation_ko}] }. "
+                      + "Only include items that are likely true vulnerabilities. Keep details_ko and recommendation_ko concise (1-2 sentences). Do not include raw code except filenames and line numbers.\n\n";
 
-      # 결과를 PR 코멘트/Issue로 게시
-      - name: Post structured Korean report
+            // Append file contents (only for relevant extensions)
+            for (const f of filesToAnalyze) {
+              const content = allFiles[f] || '[not available]';
+              // skip large binaries or placeholders
+              prompt += `--- ${f} ---\n`;
+              prompt += content + "\n\n";
+            }
+
+            // If nothing to analyze, write empty
+            if (filesToAnalyze.length === 0) {
+              fs.writeFileSync('ai_summary_structured.json', JSON.stringify(structured, null, 2));
+              return;
+            }
+
+            const body = {
+              model: "gpt-4o-mini",
+              messages: [
+                { role: "system", content: "You are a concise, security-focused code reviewer. Map findings to CWE and OWASP Top10 when possible. Respond with valid JSON only." },
+                { role: "user", content: prompt }
+              ],
+              temperature: 0,
+              max_tokens: 1400
+            };
+
+            try {
+              const resp = await fetch("https://api.openai.com/v1/chat/completions", {
+                method: "POST",
+                headers: {
+                  "Authorization": `Bearer ${apiKey}`,
+                  "Content-Type": "application/json"
+                },
+                body: JSON.stringify(body)
+              });
+
+              if (resp.ok) {
+                const j = await resp.json();
+                const text = j.choices?.[0]?.message?.content || '';
+                // Try parse; if not JSON, attempt to extract JSON substring
+                try {
+                  structured = JSON.parse(text);
+                } catch (e) {
+                  const m = text.match(/\{[\s\S]*\}$/);
+                  if (m) {
+                    try { structured = JSON.parse(m[0]); } catch(e2) { structured = { overall: "Unknown", note: "parse error" }; }
+                  } else {
+                    structured = { overall: "Unknown", note: "Model returned non-JSON. Raw: " + text.slice(0,800) };
+                  }
+                }
+              } else {
+                const t = await resp.text();
+                structured = { overall: "Unknown", note: `[OpenAI error ${resp.status}] ${t.slice(0,800)}` };
+              }
+            } catch (e) {
+              structured = { overall: "Unknown", note: "Fetch failed: " + String(e) };
+            }
+
+            fs.writeFileSync('ai_summary_structured.json', JSON.stringify(structured, null, 2));
+
+      - name: Post structured Korean report (PR comment or Issue)
         uses: actions/github-script@v7
         with:
           script: |
@@ -139,12 +246,12 @@ jobs:
             let json = { overall: "Unknown", items: [] };
             if (fs.existsSync('ai_summary_structured.json')) {
               try { json = JSON.parse(fs.readFileSync('ai_summary_structured.json','utf8')); }
-              catch { json = { overall: "Unknown", items: [], note:"parse error" }; }
+              catch { json = { overall: "Unknown", items: [], note: "parse error" }; }
             }
 
-            const overallKor = (json.overall==="Block") ? "차단 필요" :
-                               (json.overall==="Manual review") ? "수동 검토 필요" :
-                               (json.overall==="Low") ? "낮음" : "취약점 없음";
+            // Map overall to Korean
+            const overallMap = { "Block":"차단 필요", "Manual review":"수동 검토 필요", "Low":"낮음", "None":"취약점 없음" };
+            const overallKor = overallMap[json.overall] || json.overall || "알 수 없음";
 
             let md = [];
             md.push("### 🤖 AI Security Review (자동 보고)");
@@ -152,16 +259,34 @@ jobs:
             md.push(`**전체 판단:** ${overallKor}`);
             md.push("");
 
-            if (!json.items || json.items.length===0) {
+            if (!json.items || json.items.length === 0) {
               md.push("_취약점 없음 (자동 분석)_");
             } else {
-              md.push("|파일|라인|취약점 존재|심각도|CWE|OWASP|설명|권고|");
+              md.push("|파일|라인|취약점|심각도|CWE|OWASP|문제 요약 (한국어)|권고 (한국어)|");
               md.push("|---|---:|---|---|---|---|---|---|");
               json.items.forEach(it=>{
-                md.push(`|${it.file||'-'}|${it.line||'-'}|${it.present?'있음':'없음'}|${it.severity||'-'}|${it.cwe||'-'}|${it.owasp||'-'}|${it.details_ko||'-'}|${it.recommendation_ko||'-'}|`);
+                const file = it.file || '-';
+                const line = it.line || '-';
+                const present = (it.present===false) ? '아님' : '있음';
+                const sev = it.severity || '-';
+                const cwe = it.cwe || '-';
+                const owasp = it.owasp || '-';
+                const desc = (it.details_ko || it.short_desc || '-').replace(/\r?\n/g,' ');
+                const rec = (it.recommendation_ko || '-').replace(/\r?\n/g,' ');
+                md.push(`|${file}|${line}|${present}|${sev}|${cwe}|${owasp}|${desc}|${rec}|`);
               });
             }
 
+            md.push("");
+            md.push("> ※ 자동 도구 결과입니다. '차단 필요' 또는 '치명적' 항목은 담당자가 즉시 수동 검토·조치하세요.");
+            md.push("");
+            md.push("<details><summary>English original / raw structured JSON</summary>");
+            md.push("");
+            md.push("```json");
+            md.push(fs.existsSync('ai_summary_structured.json') ? fs.readFileSync('ai_summary_structured.json','utf8') : '{}');
+            md.push("```");
+            md.push("");
+            md.push("</details>");
             md.push("");
             md.push("_자동 생성 리포트 — 담당자 검토 필수_");
 
