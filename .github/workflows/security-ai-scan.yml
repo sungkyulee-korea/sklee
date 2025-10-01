@@ -4,7 +4,7 @@ on:
   pull_request:
     types: [opened, synchronize, reopened]
   push:
-    branches: ['**']   # 원하면 main만: ['main']
+    branches: ['**']   # 필요시 main만 ['main']
 
 permissions:
   contents: read
@@ -24,6 +24,7 @@ jobs:
         with:
           fetch-depth: 0
 
+      # 변경 파일/DIFF 추출
       - name: Get changed files & diff (PR or push)
         id: changed
         uses: actions/github-script@v7
@@ -32,6 +33,7 @@ jobs:
             const isPR = !!context.payload.pull_request;
             let diff = '';
             let files = [];
+
             if (isPR) {
               const prNumber = context.payload.pull_request.number;
               const list = await github.rest.pulls.listFiles({
@@ -41,6 +43,7 @@ jobs:
                 per_page: 100
               });
               files = list.data.map(f => f.filename);
+
               const diffResp = await github.request(
                 "GET /repos/{owner}/{repo}/pulls/{pull_number}",
                 {
@@ -54,6 +57,7 @@ jobs:
             } else {
               const before = context.payload.before;
               const after  = context.payload.after;
+
               if (before && after && before !== '0000000000000000000000000000000000000000') {
                 const comp = await github.rest.repos.compareCommits({
                   owner: context.repo.owner,
@@ -63,30 +67,22 @@ jobs:
                 });
                 files = (comp.data.files || []).map(f => f.filename);
                 diff = (comp.data.files || []).map(f =>
-                  `--- ${f.filename}\n${f.patch || '[binary or no patch]'}\n`
+                  `--- ${f.filename}\n${f.patch || '[binary/no patch]'}\n`
                 ).join("\n");
-              } else {
-                const tree = await github.rest.git.getTree({
-                  owner: context.repo.owner,
-                  repo: context.repo.repo,
-                  tree_sha: context.sha,
-                  recursive: "1"
-                }).catch(()=>({data:{tree:[]}}));
-                files = (tree.data.tree || []).map(t => t.path).slice(0, 100);
-                diff = '';
               }
             }
+
             const maxChars = parseInt(process.env.MAX_DIFF_CHARS || '90000', 10);
             if (diff.length > maxChars) diff = diff.slice(0, maxChars) + "\n\n[...diff truncated]";
+
             core.setOutput("files", files.join("\n"));
             core.setOutput("diff", diff);
 
-      - name: Call OpenAI via github-script (robust)
-        id: call_openai
+      # OpenAI 호출 → JSON 구조화 (CWE, OWASP, 설명, 권고 포함)
+      - name: Generate structured security report (CWE/OWASP)
+        id: structured
         uses: actions/github-script@v7
         env:
-          FILES: ${{ steps.changed.outputs.files }}
-          DIFF:  ${{ steps.changed.outputs.diff }}
           OPENAI_API_KEY: ${{ env.OPENAI_API_KEY }}
         with:
           script: |
@@ -94,75 +90,24 @@ jobs:
             const files = process.env.FILES || '';
             const diff  = process.env.DIFF  || '';
             const apiKey = process.env.OPENAI_API_KEY || '';
-            let out = '';
-            if (!apiKey) {
-              out = 'ERROR: OPENAI_API_KEY is empty';
-            } else {
-              const body = {
-                model: "gpt-4o-mini",
-                messages: [
-                  { role: "system", content: "You are a concise, security-focused code reviewer." },
-                  { role: "user", content:
-                      "아래 변경사항을 보안 관점에서 점검하세요.\n" +
-                      "응답 형식:\n" +
-                      "Overall: (Block | Manual review | Low)\n" +
-                      "Items: filename:line (severity) - short_desc - one-line fix\n\n" +
-                      "FILES:\n" + files + "\n\nDIFF:\n" + diff
-                  }
-                ],
-                max_tokens: 1000,
-                temperature: 0
-              };
-              try {
-                const resp = await fetch("https://api.openai.com/v1/chat/completions", {
-                  method: "POST",
-                  headers: {
-                    "Authorization": `Bearer ${apiKey}`,
-                    "Content-Type": "application/json"
-                  },
-                  body: JSON.stringify(body)
-                });
-                if (resp.ok) {
-                  const j = await resp.json();
-                  out = (j.choices?.[0]?.message?.content) || "No summary generated.";
-                } else {
-                  const t = await resp.text();
-                  out = `[OpenAI error ${resp.status}]\n` + t.slice(0, 2000);
-                }
-              } catch (e) {
-                out = 'Fetch failed: ' + String(e);
-              }
-            }
-            fs.writeFileSync('ai_summary.txt', out);
 
-      # 🔹 새로 추가: 한글 요약(조치 권고 포함) 생성
-      - name: Generate Korean Actionable Summary
-        if: ${{ always() }}
-        uses: actions/github-script@v7
-        env:
-          OPENAI_API_KEY: ${{ env.OPENAI_API_KEY }}
-        with:
-          script: |
-            const fs = require('fs');
-            const apiKey = process.env.OPENAI_API_KEY || '';
-            const english = fs.existsSync('ai_summary.txt')
-              ? fs.readFileSync('ai_summary.txt','utf8') : 'No summary.';
-            let ko = '';
-            if (!apiKey || english.startsWith('[OpenAI error') || english.startsWith('ERROR')) {
-              // API 오류면 간단한 규칙 기반 변환이라도 제공
-              ko = "⚠️ 한국어 요약을 생성하지 못했습니다.\n\n원문:\n" + english;
-            } else {
+            let structured = { overall: "Unknown", items: [] };
+
+            if (apiKey) {
               const body = {
                 model: "gpt-4o-mini",
                 messages: [
                   { role: "system", content:
-                    "다음 보안 점검 결과를 한국어로 간결하게 요약하라. '조치 권고'를 불릿으로 정리하고, " +
-                    "파일:라인, 심각도(치명적/높음/보통/낮음)를 한국어로 표기하라. 8줄 이내." },
-                  { role: "user", content: english }
+                    "You are a security code reviewer. Summarize vulnerabilities in JSON. " +
+                    "Fields: overall, items[{file,line,severity,cwe,owasp,present,details_ko,recommendation_ko}]. " +
+                    "overall ∈ {Block, Manual review, Low, None}. " +
+                    "details_ko = 간단한 한국어 문제 설명, recommendation_ko = 한국어 권고 조치." },
+                  { role: "user", content: "FILES:\n" + files + "\n\nDIFF:\n" + diff }
                 ],
-                max_tokens: 600,
+                max_tokens: 900,
                 temperature: 0
               };
+
               try {
                 const resp = await fetch("https://api.openai.com/v1/chat/completions", {
                   method: "POST",
@@ -174,40 +119,54 @@ jobs:
                 });
                 if (resp.ok) {
                   const j = await resp.json();
-                  ko = (j.choices?.[0]?.message?.content) || "한국어 요약 생성 실패.";
-                } else {
-                  const t = await resp.text();
-                  ko = `한국어 요약 생성 실패 [${resp.status}]\n` + t.slice(0, 2000) + "\n\n원문:\n" + english;
+                  try { structured = JSON.parse(j.choices[0].message.content); }
+                  catch { structured = { overall: "Unknown", note: "JSON parse error" }; }
                 }
               } catch (e) {
-                ko = '한국어 요약 생성 실패: ' + String(e) + "\n\n원문:\n" + english;
+                structured = { overall: "Unknown", note: "Fetch failed" };
               }
             }
-            fs.writeFileSync('ai_summary_ko.txt', ko);
 
-      - name: Post result (PR comment or Issue)
+            fs.writeFileSync('ai_summary_structured.json', JSON.stringify(structured,null,2));
+            core.setOutput("structured_path", "ai_summary_structured.json");
+
+      # 결과를 PR 코멘트/Issue로 게시
+      - name: Post structured Korean report
         uses: actions/github-script@v7
         with:
           script: |
             const fs = require('fs');
-            const en = fs.existsSync('ai_summary.txt')  ? fs.readFileSync('ai_summary.txt','utf8')  : 'No summary.';
-            const ko = fs.existsSync('ai_summary_ko.txt')? fs.readFileSync('ai_summary_ko.txt','utf8'): '한국어 요약 없음.';
-            const isPR = !!context.payload.pull_request;
+            let json = { overall: "Unknown", items: [] };
+            if (fs.existsSync('ai_summary_structured.json')) {
+              try { json = JSON.parse(fs.readFileSync('ai_summary_structured.json','utf8')); }
+              catch { json = { overall: "Unknown", items: [], note:"parse error" }; }
+            }
 
-            const body = [
-              "### 🤖 AI Security Review",
-              "",
-              "**KOR 요약(조치 권고)**",
-              ko,
-              "",
-              "<details><summary>English original</summary>",
-              "",
-              en,
-              "",
-              "</details>",
-              "",
-              "_자동 생성 — 담당자 검토 필수_"
-            ].join("\n");
+            const overallKor = (json.overall==="Block") ? "차단 필요" :
+                               (json.overall==="Manual review") ? "수동 검토 필요" :
+                               (json.overall==="Low") ? "낮음" : "취약점 없음";
+
+            let md = [];
+            md.push("### 🤖 AI Security Review (자동 보고)");
+            md.push("");
+            md.push(`**전체 판단:** ${overallKor}`);
+            md.push("");
+
+            if (!json.items || json.items.length===0) {
+              md.push("_취약점 없음 (자동 분석)_");
+            } else {
+              md.push("|파일|라인|취약점 존재|심각도|CWE|OWASP|설명|권고|");
+              md.push("|---|---:|---|---|---|---|---|---|");
+              json.items.forEach(it=>{
+                md.push(`|${it.file||'-'}|${it.line||'-'}|${it.present?'있음':'없음'}|${it.severity||'-'}|${it.cwe||'-'}|${it.owasp||'-'}|${it.details_ko||'-'}|${it.recommendation_ko||'-'}|`);
+              });
+            }
+
+            md.push("");
+            md.push("_자동 생성 리포트 — 담당자 검토 필수_");
+
+            const body = md.join("\n");
+            const isPR = !!context.payload.pull_request;
 
             if (isPR) {
               await github.rest.issues.createComment({
@@ -221,6 +180,6 @@ jobs:
                 owner: context.repo.owner,
                 repo: context.repo.repo,
                 title: `[AI Security Scan] 자동 리포트 - ${new Date().toISOString().slice(0,10)}`,
-                body: `브랜치: ${context.ref}\n\n${body}`
+                body
               });
             }
