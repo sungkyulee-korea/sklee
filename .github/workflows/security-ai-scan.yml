@@ -1,11 +1,11 @@
-name: Security AI Scan (Semgrep + OpenAI)
+name: Security AI Scan (Semgrep + Heuristics + OpenAI)
 
 on:
   workflow_dispatch:
   pull_request:
     types: [opened, synchronize, reopened]
   push:
-    branches: ['**']   # 필요 시 ['main']으로 제한
+    branches: ['**']
 
 permissions:
   contents: read
@@ -41,7 +41,7 @@ jobs:
                 owner: context.repo.owner,
                 repo: context.repo.repo,
                 pull_number: prNumber,
-                per_page: 300
+                per_page: 500
               });
               files = list.data.map(f => f.filename);
 
@@ -117,30 +117,69 @@ jobs:
             fs.writeFileSync('changed_files_full.json', JSON.stringify(out, null, 2));
             core.setOutput('path','changed_files_full.json');
 
-      - name: Setup Python for semgrep
+      - name: Create small custom semgrep rule file
+        run: |
+          cat > semgrep-custom.yml <<'EOF'
+rules:
+  - id: java-sqli-stmt-concat
+    languages: [java]
+    message: "Possible SQL injection: Statement.execute/executeQuery with string concatenation."
+    severity: ERROR
+    patterns:
+      - pattern-either:
+          - pattern: |
+              $ST = $CONN.createStatement();
+              $ST.execute($Q)
+          - pattern: |
+              $ST = $CONN.createStatement();
+              $ST.executeQuery($Q)
+      - pattern: $Q = $A + $B
+      - metavariable-regex:
+          metavariable: $Q
+          regex: "\\+"
+  - id: java-xss-getwriter
+    languages: [java]
+    message: "Possible XSS: writing user-controlled input to response without encoding."
+    severity: ERROR
+    patterns:
+      - pattern: response.getWriter().println($X)
+      - pattern-either:
+          - pattern: $X
+          - pattern: $X + $Y
+EOF
+          echo "semgrep-custom.yml created"
+
+      - name: Setup Python & Install semgrep
         uses: actions/setup-python@v4
         with:
           python-version: '3.10'
 
-      - name: Install semgrep (pip)
+      - name: Install semgrep
         run: |
           python -m pip install --upgrade pip
           pip install semgrep
           semgrep --version
 
-      - name: Run semgrep (policy-based static scan)
+      - name: Run semgrep (built-in + custom)
         id: semgrep
         run: |
-          semgrep --config p/ci --json --output semgrep-results.json || true
-          if [ -f semgrep-results.json ]; then
-            echo "Semgrep results saved to semgrep-results.json"
-            if command -v jq >/dev/null 2>&1; then
-              echo "Findings:" $(jq '.results | length' semgrep-results.json)
-            fi
-          else
-            echo "No semgrep output file found."
-          fi
-        shell: bash
+          # run built-in pack and custom rules; allow non-zero exit
+          semgrep --config p/ci --json --output semgrep-pci.json || true
+          semgrep --config ./semgrep-custom.yml --json --output semgrep-custom.json || true
+          # merge results into a single file (simple concatenation into results array)
+          python - << 'PY'
+import json,sys
+out = {"results": []}
+for fn in ("semgrep-pci.json","semgrep-custom.json"):
+    try:
+        j = json.load(open(fn))
+        if isinstance(j.get("results"), list):
+            out["results"].extend(j["results"])
+    except Exception:
+        pass
+json.dump(out, open("semgrep-results.json","w"), indent=2)
+print("Semgrep merged results written to semgrep-results.json")
+PY
 
       - name: Choose files flagged by semgrep (or fallback to changed files)
         id: chosen
@@ -176,7 +215,7 @@ jobs:
             const patterns = {
               XSS_output_like: /(response\.getWriter|getWriter\(|println\()/i,
               XSS_replaceAll: /\.replaceAll\(/i,
-              SQL_concat_in_exec: /(execute(Query|Update)?\(|execute\().*\+.*/i,
+              SQL_concat_in_exec: /(execute(Query|Update)?\(|execute\).*\+.*/i,
               SQL_stmt: /\bnew\s+Statement\b|\bStatement\b/i,
               SQL_prepare_concat: /prepareStatement\(.+\+/i,
               LDAP_usage: /\b(InitialDirContext|DirContext|ldap|LDAP)\b/i,
@@ -190,14 +229,13 @@ jobs:
                 if (fs.existsSync(f)) {
                   const lines = fs.readFileSync(f,'utf8').split(/\r?\n/);
                   lines.forEach((line, idx) => {
-                    for (const [k, re] of Object.entries(patterns)) {
+                    for (const [k, reStr] of Object.entries(patterns)) {
+                      const re = new RegExp(reStr);
                       if (re.test(line)) {
                         hits.push({ line: idx+1, pattern: k, snippet: line.trim().slice(0,300) });
                       }
                     }
                   });
-                } else {
-                  // file not checked out / binary
                 }
               } catch (e) {
                 hits.push({ error: String(e) });
@@ -258,7 +296,7 @@ jobs:
             const prompt = [
               "You are a precise security code reviewer. For each file below, detect likely real vulnerabilities and map to CWE and OWASP Top10 if possible.",
               "Return valid JSON only with structure: { overall: 'Block'|'Manual review'|'Low'|'None', items:[{file,line,severity,cwe,owasp,present,details_ko,recommendation_ko}] }.",
-              "Prioritize files marked HIGH (filename contains 'bad'). Only include items that are likely true vulnerabilities.",
+              "Prioritize files marked HIGH (filename contains 'bad'). Only include items that are likely true vulnerabilities. If a file has no vulnerability, include an item for that file with present:false and details_ko:'취약점 없음'.",
               "",
               "FILES LIST:",
               fileListText,
@@ -269,18 +307,18 @@ jobs:
               "FILE CONTENTS (truncated where needed):",
               filesBlock,
               "",
-              "For each vulnerability include CWE code, OWASP mapping if possible, 1-line mitigation suggestion, brief Korean explanation (1-2 sentences).",
-              "If no vulnerability for a file, include an item for that file with present:false and details_ko:'취약점 없음'.",
+              "For each vulnerability include CWE code, OWASP mapping if possible, one-line mitigation suggestion, brief Korean explanation (1-2 sentences).",
+              "Do not include raw code in the JSON. Respond with JSON only."
             ].join("\n");
 
             const body = {
               model: "gpt-4o-mini",
               messages: [
-                { role: "system", content: "You are a concise security-focused code reviewer. Produce JSON only." },
+                { role: "system", content: "You are a concise, security-focused code reviewer. Produce JSON only." },
                 { role: "user", content: prompt }
               ],
               temperature: 0,
-              max_tokens: 1600
+              max_tokens: 1800
             };
 
             try {
@@ -317,6 +355,7 @@ jobs:
             fs.writeFileSync('ai_summary_structured.json', JSON.stringify(structured, null, 2));
 
       - name: Post structured Korean report (PR comment or Issue) including file list & heuristics
+        if: always()
         uses: actions/github-script@v7
         with:
           script: |
