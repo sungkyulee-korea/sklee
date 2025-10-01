@@ -117,13 +117,13 @@ jobs:
             fs.writeFileSync('changed_files_full.json', JSON.stringify(out, null, 2));
             core.setOutput('path','changed_files_full.json');
 
-      - name: Create small custom semgrep rule file
+      - name: Create semgrep custom rules file
         run: |
           cat > semgrep-custom.yml <<'EOF'
 rules:
   - id: java-sqli-stmt-concat
     languages: [java]
-    message: "Possible SQL injection: Statement.execute/executeQuery with string concatenation."
+    message: "Possible SQL injection: Statement.execute with string concatenation."
     severity: ERROR
     patterns:
       - pattern-either:
@@ -134,18 +134,12 @@ rules:
               $ST = $CONN.createStatement();
               $ST.executeQuery($Q)
       - pattern: $Q = $A + $B
-      - metavariable-regex:
-          metavariable: $Q
-          regex: "\\+"
   - id: java-xss-getwriter
     languages: [java]
     message: "Possible XSS: writing user-controlled input to response without encoding."
     severity: ERROR
     patterns:
       - pattern: response.getWriter().println($X)
-      - pattern-either:
-          - pattern: $X
-          - pattern: $X + $Y
 EOF
           echo "semgrep-custom.yml created"
 
@@ -163,12 +157,10 @@ EOF
       - name: Run semgrep (built-in + custom)
         id: semgrep
         run: |
-          # run built-in pack and custom rules; allow non-zero exit
           semgrep --config p/ci --json --output semgrep-pci.json || true
           semgrep --config ./semgrep-custom.yml --json --output semgrep-custom.json || true
-          # merge results into a single file (simple concatenation into results array)
           python - << 'PY'
-import json,sys
+import json
 out = {"results": []}
 for fn in ("semgrep-pci.json","semgrep-custom.json"):
     try:
@@ -213,14 +205,14 @@ PY
             const fs = require('fs');
             const files = fs.existsSync('files_to_analyze.json') ? JSON.parse(fs.readFileSync('files_to_analyze.json','utf8')) : [];
             const patterns = {
-              XSS_output_like: /(response\.getWriter|getWriter\(|println\()/i,
-              XSS_replaceAll: /\.replaceAll\(/i,
-              SQL_concat_in_exec: /(execute(Query|Update)?\(|execute\).*\+.*/i,
-              SQL_stmt: /\bnew\s+Statement\b|\bStatement\b/i,
-              SQL_prepare_concat: /prepareStatement\(.+\+/i,
-              LDAP_usage: /\b(InitialDirContext|DirContext|ldap|LDAP)\b/i,
-              XPath_usage: /\bXPath\b|\bevaluate\(/i,
-              File_read: /\bFileReader\b|\bBufferedReader\b|\breadLine\(/i
+              XSS_output_like: 'response.getWriter|getWriter\\(|println\\(',
+              XSS_replaceAll: '\\.replaceAll\\(',
+              SQL_concat_in_exec: 'execute(Query|Update)?\\(|execute\\).*\\+',
+              SQL_stmt: '\\bnew\\s+Statement\\b|\\bStatement\\b',
+              SQL_prepare_concat: 'prepareStatement\\(.+\\+',
+              LDAP_usage: '\\b(InitialDirContext|DirContext|ldap|LDAP)\\b',
+              XPath_usage: '\\bXPath\\b|\\bevaluate\\(',
+              File_read: '\\bFileReader\\b|\\bBufferedReader\\b|\\breadLine\\('
             };
             const out = {};
             for (const f of files) {
@@ -230,7 +222,7 @@ PY
                   const lines = fs.readFileSync(f,'utf8').split(/\r?\n/);
                   lines.forEach((line, idx) => {
                     for (const [k, reStr] of Object.entries(patterns)) {
-                      const re = new RegExp(reStr);
+                      const re = new RegExp(reStr, 'i');
                       if (re.test(line)) {
                         hits.push({ line: idx+1, pattern: k, snippet: line.trim().slice(0,300) });
                       }
@@ -268,7 +260,6 @@ PY
               return;
             }
 
-            // Build file list + heuristics text
             let fileListText = "Files to analyze (priority: filename containing 'bad' marked HIGH):\n";
             for (const f of files) {
               const priority = /bad/i.test(f) ? "HIGH" : "normal";
@@ -285,7 +276,6 @@ PY
               });
             }
 
-            // Build limited contents block
             let filesBlock = "";
             for (const f of files) {
               const c = allFiles[f] || "[not available]";
