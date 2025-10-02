@@ -1,239 +1,139 @@
 #!/usr/bin/env python3
 # .github/scripts/security_scan.py
-# Create ai_report.md and ai_summary.json and post to PR (comment) or create an Issue.
-# Requires: requests (installed by workflow)
+# 설치: pip install requests
+import os, sys, json, requests, textwrap, traceback
 
-import os
-import sys
-import json
-import time
-from pathlib import Path
+OUT_MD = "report.md"
+OUT_STRUCT = "ai_summary_structured.json"
+SEMGREP = "semgrep-results.json"
+OPENAI_KEY = os.environ.get("OPENAI_API_KEY", "").strip()
 
-try:
-    import requests
-except Exception as e:
-    print("requests not installed:", e)
-    sys.exit(1)
-
-WORKDIR = Path.cwd()
-REPO = os.environ.get('GITHUB_REPOSITORY')  # owner/repo
-GITHUB_TOKEN = os.environ.get('GITHUB_TOKEN')
-OPENAI_API_KEY = os.environ.get('OPENAI_API_KEY')
-OPENAI_MODEL = os.environ.get('OPENAI_MODEL') or "gpt-4o-mini"
-
-MAX_FILE_BYTES = int(os.environ.get('MAX_FILE_BYTES', '200000'))
-MAX_FILES = int(os.environ.get('MAX_FILES', '8'))
-
-SEMgrep_PATH = WORKDIR / "semgrep-results.json"
-AI_REPORT = WORKDIR / "ai_report.md"
-AI_SUMMARY = WORKDIR / "ai_summary.json"
-
-def find_candidate_files(max_files=MAX_FILES):
-    # 우선순위: 파일명에 'bad' 포함 또는 CWE 접두사, 그 다음 모든 .java
-    candidates = []
-    for p in sorted(WORKDIR.rglob("*.java")):
-        name = p.name.lower()
-        if 'bad' in name or name.startswith('cwe'):
-            candidates.append(p)
-    if len(candidates) < max_files:
-        # 추가로 다른 java 파일 보충
-        for p in sorted(WORKDIR.rglob("*.java")):
-            if p not in candidates:
-                candidates.append(p)
-            if len(candidates) >= max_files:
-                break
-    return candidates[:max_files]
-
-def read_file_excerpt(path, max_bytes=MAX_FILE_BYTES):
+def load_semgrep():
+    if not os.path.exists(SEMGREP):
+        return []
     try:
-        if not path.exists():
-            return None
-        size = path.stat().st_size
-        if size > max_bytes:
-            return None
-        text = path.read_text(encoding='utf8', errors='ignore')
-        # limit length for OpenAI prompt
-        if len(text) > 40000:
-            return text[:40000] + "\n\n[...truncated]"
-        return text
+        with open(SEMGREP, "r", encoding="utf8") as f:
+            data = json.load(f)
+        return data.get("results", []) if isinstance(data, dict) else []
     except Exception as e:
-        print(f"Error reading {path}: {e}")
-        return None
+        print("Failed to load semgrep results:", e)
+        return []
 
-def semgrep_summary_text():
-    if not SEMgrep_PATH.exists():
-        return "Semgrep: no results file found."
-    try:
-        j = json.loads(SEMgrep_PATH.read_text(encoding='utf8'))
-        results = j.get("results", []) if isinstance(j, dict) else []
-        lines = [f"Semgrep findings: {len(results)}"]
-        for r in results[:40]:
-            path = r.get("path") or (r.get("extra") or {}).get("metadata", {}).get("file", "-")
-            start = (r.get("start") or {}).get("line") if isinstance(r.get("start"), dict) else r.get("start", "-")
-            msg = (r.get("extra") or {}).get("message") or r.get("message") or ""
-            sev = (r.get("extra") or {}).get("severity") or ""
-            lines.append(f"- {path}:{start} [{sev}] {msg}")
-        return "\n".join(lines)
-    except Exception as e:
-        return f"Semgrep parse error: {e}"
+def build_fallback_report(results):
+    lines = []
+    lines.append("# AI Security Scan (자동 리포트)")
+    lines.append("")
+    if not results:
+        lines.append("### 전체 판단: 취약점 없음 (자동 분석)")
+        lines.append("")
+        lines.append("- Semgrep 기준으로 탐지된 항목이 없습니다.")
+    else:
+        lines.append("### 전체 판단: 취약점 발견 (자동 분석)")
+        lines.append("")
+        lines.append("#### Semgrep 발견 항목:")
+        for r in results:
+            path = r.get("path") or r.get("extra",{}).get("metadata",{}).get("file","-")
+            msg = r.get("extra",{}).get("message") or r.get("message") or ""
+            start = "-"
+            s = r.get("start")
+            if isinstance(s, dict):
+                start = s.get("line", "-")
+            elif s:
+                start = s
+            sev = r.get("extra",{}).get("severity", "")
+            lines.append(f"- {path}:{start} ({sev}) - {msg}")
+    lines.append("")
+    lines.append("## 권고 요약")
+    lines.append("- 자동분석 결과를 기반으로 합니다. 중요한 코드는 수동 검토 권장.")
+    lines.append("")
+    lines.append("_자동 생성 리포트 — 담당자 검토 필요_")
+    return "\n".join(lines)
 
-def build_prompt(file_excerpts, semgrep_text):
-    files_desc = []
-    for filename, excerpt in file_excerpts:
-        safe_excerpt = excerpt if excerpt else "[no excerpt]"
-        files_desc.append(f"--- FILE: {filename} ---\n{safe_excerpt}\n")
-    files_joined = "\n\n".join(files_desc) if files_desc else "(no files attached)"
-
-    instruction = (
-        "You are a concise security-focused code reviewer. "
-        "Given the semgrep summary and file excerpts, return first a JSON object, then a short Korean markdown summary.\n\n"
-        "JSON format (exact keys):\n"
-        "{\n"
-        "  \"overall\": \"Block\" | \"Manual review\" | \"Low\",\n"
-        "  \"items\": [ {\"file\":\"...\",\"line\":123, \"severity\":\"High|Medium|Low\", \"title\":\"short title\", \"cwe\":\"CWE-xxx or ''\",\"owasp\":\"OWASP-xxx or ''\",\"description\":\"short description\",\"one_line_fix\":\"code or fix\"} ],\n"
-        "  \"summary_kr\":\"short Korean summary\"\n"
-        "}\n\n"
-        "Now analyze. Use semgrep output and code excerpts. Focus on SQL injection, XSS, LDAP, XPath, command injection first. "
-        "If nothing found, set overall=\"Low\" and items = [].\n\n"
-        "SEMgrep SUMMARY:\n" + semgrep_text + "\n\n"
-        "FILES:\n" + files_joined
+def call_openai_prompt(diff_text, files_list):
+    system = "You are a concise code-security reviewer. Provide short Korean summary and recommended fixes. Response in JSON with keys: overall (Block|Manual review|Low), items (list of {file,line,severity,short_desc,fix}), summary_kor."
+    user = (
+        "아래 semgrep 결과(또는 변경파일 리스트)를 바탕으로 취약점 요약과 간단 권고를 한국어로 JSON 형식으로 출력하세요.\n\n"
+        "FILES:\n" + ("\n".join(files_list[:200])) + "\n\n"
+        "DIFF/SEMgrep:\n" + (diff_text[:12000])
     )
-    return instruction
-
-def call_openai(prompt_text):
-    if not OPENAI_API_KEY:
-        return {"error": "OPENAI_API_KEY not set"}
-    url = "https://api.openai.com/v1/chat/completions"
-    headers = {
-        "Authorization": f"Bearer {OPENAI_API_KEY}",
-        "Content-Type": "application/json"
-    }
-    messages = [
-        {"role":"system","content":"You are a concise security-focused code reviewer."},
-        {"role":"user","content": prompt_text}
-    ]
     body = {
-        "model": OPENAI_MODEL,
-        "messages": messages,
-        "max_tokens": 1200,
+        "model": "gpt-4o-mini",
+        "messages": [
+            {"role":"system","content":system},
+            {"role":"user","content":user}
+        ],
+        "max_tokens": 800,
         "temperature": 0
     }
+    headers = {"Authorization": f"Bearer {OPENAI_KEY}", "Content-Type": "application/json"}
     try:
-        r = requests.post(url, headers=headers, json=body, timeout=60)
+        resp = requests.post("https://api.openai.com/v1/chat/completions", headers=headers, json=body, timeout=30)
+        if resp.status_code == 200:
+            j = resp.json()
+            text = j.get("choices",[{}])[0].get("message",{}).get("content","")
+            return text, j
+        else:
+            return f"[OpenAI error {resp.status_code}] {resp.text[:1000]}", None
     except Exception as e:
-        return {"error": f"Request failed: {e}"}
-    if r.status_code != 200:
-        # return status and text for debug
-        text = r.text
-        return {"error": f"OpenAI status {r.status_code}", "detail": text}
-    try:
-        j = r.json()
-        content = j.get("choices", [{}])[0].get("message", {}).get("content", "")
-        return {"ok": True, "content": content, "raw": j}
-    except Exception as e:
-        return {"error": f"OpenAI parse error: {e}", "text": r.text}
-
-def post_issue(title, body):
-    if not GITHUB_TOKEN or not REPO:
-        return {"error":"No GITHUB_TOKEN or REPO"}
-    url = f"https://api.github.com/repos/{REPO}/issues"
-    headers = {"Authorization": f"Bearer {GITHUB_TOKEN}", "Accept": "application/vnd.github+json"}
-    payload = {"title": title, "body": body}
-    try:
-        r = requests.post(url, headers=headers, json=payload, timeout=30)
-        try:
-            return {"status": r.status_code, "json": r.json()}
-        except:
-            return {"status": r.status_code, "text": r.text}
-    except Exception as e:
-        return {"error": str(e)}
-
-def post_pr_comment(pr_number, body):
-    if not GITHUB_TOKEN or not REPO:
-        return {"error":"No GITHUB_TOKEN or REPO"}
-    url = f"https://api.github.com/repos/{REPO}/issues/{pr_number}/comments"
-    headers = {"Authorization": f"Bearer {GITHUB_TOKEN}", "Accept": "application/vnd.github+json"}
-    payload = {"body": body}
-    try:
-        r = requests.post(url, headers=headers, json=payload, timeout=30)
-        try:
-            return {"status": r.status_code, "json": r.json()}
-        except:
-            return {"status": r.status_code, "text": r.text}
-    except Exception as e:
-        return {"error": str(e)}
-
-def detect_pr_from_event():
-    event_path = os.environ.get("GITHUB_EVENT_PATH")
-    if not event_path or not os.path.exists(event_path):
-        return None
-    try:
-        ev = json.loads(open(event_path,'r',encoding='utf8').read())
-        pr = ev.get("pull_request")
-        if pr:
-            return pr.get("number")
-    except Exception as e:
-        print("Error parsing event file:", e)
-    return None
+        return f"[OpenAI exception] {str(e)}", None
 
 def main():
-    print("=== security_scan.py start ===")
-    files = find_candidate_files()
-    print("Found candidate files (count):", len(files))
-    excerpts = []
-    for p in files:
-        txt = read_file_excerpt(p)
-        if txt:
-            excerpts.append((str(p.relative_to(WORKDIR)), txt))
-            print(f"Included excerpt: {p} (len {len(txt)})")
-        else:
-            print(f"Skipped (too large or unreadable): {p}")
+    results = load_semgrep()
+    # build fallback report
+    fallback = build_fallback_report(results)
 
-    sem_text = semgrep_summary_text()
-    print("Semgrep summary (head):")
-    for l in sem_text.splitlines()[:20]:
-        print("  ", l)
-
-    prompt = build_prompt(excerpts, sem_text)
-    # Call OpenAI
-    print("Calling OpenAI...")
-    resp = call_openai(prompt)
-    if "error" in resp:
-        print("OpenAI call error:", resp.get("error"))
-        if "detail" in resp:
-            print("Detail (head):", str(resp.get("detail"))[:1000])
-        # fallback: create minimal report from semgrep
-        fallback = "# AI Security Report (fallback)\n\n"
-        fallback += "OpenAI call failed or not configured.\n\n"
-        fallback += sem_text + "\n\n"
-        fallback += "_자동 생성 리포트 (fallback)_\n"
-        AI_REPORT.write_text(fallback, encoding='utf8')
-        AI_SUMMARY.write_text(json.dumps(resp, ensure_ascii=False), encoding='utf8')
-        print("Wrote fallback ai_report.md and ai_summary.json")
-        return
-
-    content = resp.get("content","")
-    print("OpenAI returned content length:", len(content))
-    # Save outputs
-    AI_REPORT.write_text(content, encoding='utf8')
+    # attempt to call OpenAI if key is present
+    ai_note = ""
+    ai_struct = {}
+    files_list = []
+    # collect some sample files (names)
     try:
-        AI_SUMMARY.write_text(json.dumps(resp.get("raw",{}), ensure_ascii=False), encoding='utf8')
-    except Exception as e:
-        print("Failed write ai_summary.json:", e)
+        for root, dirs, files in os.walk(".", topdown=True):
+            # limit to tracked files quickly - but just collect
+            for f in files:
+                if f.endswith((".java",".py",".js",".yml",".yaml")):
+                    files_list.append(os.path.join(root, f))
+            if len(files_list) > 200:
+                break
+    except Exception:
+        pass
 
-    # Post to PR or Issue
-    pr_number = detect_pr_from_event()
-    if pr_number:
-        print("Detected PR number:", pr_number, "-> posting comment")
-        res = post_pr_comment(pr_number, content + "\n\n_자동 생성 리포트_")
-        print("PR post result:", res)
+    diff_text = ""
+    if os.path.exists(SEMGREP):
+        try:
+            diff_text = open(SEMGREP, "r", encoding="utf8").read()
+        except:
+            diff_text = ""
+
+    if OPENAI_KEY:
+        try:
+            ai_text, ai_json = call_openai_prompt(diff_text, files_list)
+            ai_note = "\n\n---\n\n" + "### AI 요약 (OpenAI 결과)\n\n" + ai_text
+            if ai_json:
+                ai_struct = ai_json
+        except Exception as e:
+            ai_note = "\n\n---\n\nAI 호출 중 오류가 발생했습니다: " + str(e)
     else:
-        print("No PR detected -> creating issue")
-        title = "[AI Security Scan] 자동 리포트 - " + time.strftime("%Y-%m-%d")
-        res = post_issue(title, content + "\n\n_자동 생성 리포트_")
-        print("Issue create result:", res)
+        ai_note = "\n\n---\n\n(OpenAI 키가 설정되지 않아 AI 요약은 수행되지 않았습니다.)"
 
-    print("=== security_scan.py done ===")
+    # write report.md (always)
+    try:
+        with open(OUT_MD, "w", encoding="utf8") as fw:
+            fw.write(fallback)
+            fw.write(ai_note)
+        print(f"{OUT_MD} created; entries: {len(results)}")
+    except Exception as e:
+        print("Failed to write report.md:", e)
+        traceback.print_exc()
+
+    # write structured summary if AI returned json
+    if ai_struct:
+        try:
+            with open(OUT_STRUCT, "w", encoding="utf8") as fw:
+                json.dump(ai_struct, fw, indent=2)
+            print(f"{OUT_STRUCT} created")
+        except Exception:
+            pass
 
 if __name__ == "__main__":
     main()
