@@ -14,6 +14,8 @@ Template File: sources-sink-81_bad.tmpl.java
  *
  * */
 
+
+
 package testcases.CWE80_XSS.s01;
 import testcasesupport.*;
 
