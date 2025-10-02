@@ -1,4 +1,4 @@
-name: Security AI Scan (unified post)
+name: Security AI Scan (stable)
 
 on:
   push:
@@ -48,37 +48,48 @@ jobs:
         id: run_semgrep_custom
         run: |
           if [ -f .semgrep.yml ] || [ -f .semgrep.yaml ]; then
-            semgrep --config .semgrep.yml --json --output semgrep-custom.json || true
+            if [ -f .semgrep.yml ]; then
+              semgrep --config .semgrep.yml --json --output semgrep-custom.json || true
+            else
+              semgrep --config .semgrep.yaml --json --output semgrep-custom.json || true
+            fi
             ls -la semgrep-custom.json || true
           else
             echo "no custom semgrep config"
           fi
 
-      - name: List .github/scripts
+      - name: Ensure scripts dir exists (debug)
         run: |
+          echo "listing .github/scripts"
+          ls -la .github || true
           ls -la .github/scripts || true
 
-      - name: Run external security script if present
+      - name: Run external security script if present (creates report.md)
         id: run_external
         run: |
           if [ -f .github/scripts/security_scan.py ]; then
-            echo "Running .github/scripts/security_scan.py"
+            echo "Running external script: .github/scripts/security_scan.py"
             python .github/scripts/security_scan.py || echo "external script failed but continuing"
           else
-            echo "No external script found - creating fallback report.md"
-            echo "# 간단 fallback 리포트" > report.md || true
-            echo "" >> report.md
-            echo "- No external script and no semgrep results processed." >> report.md || true
-            echo "_전체 리포트는 artifact로 보관됩니다._" >> report.md || true
-            head -n 50 report.md > post_body_short.md || true
+            echo "No external script found - generating fallback report.md"
+            printf "# 자동 fallback 보안 리포트\n\n- 외부 스크립트 없음. Semgrep 결과를 참고하세요.\n\n" > report.md
+            if [ -f semgrep-results.json ]; then
+              echo "Semgrep results exist; summarizing minimal info..."
+              jq -r '.results[] | "\(.path) : \(.start.line // "-") - \(.extra.message // .message // "no message")"' semgrep-results.json | head -n 30 >> report.md || true
+            fi
+            head -n 200 report.md > post_body_short.md || true
           fi
 
-      - name: Debug: show generated files and sizes
+      - name: Debug - show generated files & sizes
         run: |
+          echo "report.md:"
           ls -la report.md || true
+          echo "report.md bytes:"
           wc -c report.md || true
+          echo "post_body_short.md:"
           ls -la post_body_short.md || true
-          if [ -f post_body_short.md ]; then head -c 200 post_body_short.md || true; echo; fi
+          if [ -f post_body_short.md ]; then echo "---- post_body_short.md content ----"; head -c 200 post_body_short.md || true; echo; fi
+          echo "semgrep files:"
           ls -la semgrep-results.json semgrep-custom.json || true
 
       - name: Post result (PR comment or Issue)
