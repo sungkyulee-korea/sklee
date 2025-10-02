@@ -1,6 +1,4 @@
 # .github/scripts/security_scan.py
-# Create report.md and post_body_short.md from semgrep outputs.
-# This script is intentionally simple and robust (no external AI calls by default).
 import os, json
 
 MAX_POST_CHARS = int(os.environ.get("MAX_POST_CHARS", "1800"))
@@ -12,15 +10,16 @@ def load_semgrep(fname):
         with open(fname, "r", encoding="utf8") as f:
             j = json.load(f)
         if isinstance(j, dict) and "results" in j:
-            return j.get("results", [])
-        # older/other shapes
-        return j if isinstance(j, list) else []
+            return j.get("results")
+        if isinstance(j, list):
+            return j
     except Exception:
         return []
+    return []
 
 results = []
-results += load_semgrep("semgrep-custom.json")
-results += load_semgrep("semgrep-results.json")
+results += load_semgrep("semgrep-custom.json") or []
+results += load_semgrep("semgrep-results.json") or []
 
 lines = ["# 자동 보안 리포트 (Semgrep 초안)", ""]
 if results:
@@ -42,11 +41,9 @@ else:
 lines.append("")
 lines.append("_전체 리포트는 artifact로 보관됩니다._")
 
-# write full report
 with open("report.md", "w", encoding="utf8") as fw:
     fw.write("\n".join(lines))
 
-# prepare short post body: first ~60 lines, truncated to MAX_POST_CHARS bytes
 head_text = "\n".join(lines[:60])
 b = head_text.encode("utf8")[:MAX_POST_CHARS]
 with open("post_body_short.md", "wb") as fo:
