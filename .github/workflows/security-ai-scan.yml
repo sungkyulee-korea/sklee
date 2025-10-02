@@ -1,4 +1,4 @@
-name: Security AI Scan (debug + force-post v3)
+name: Security AI Scan (formatted KR report + post)
 
 on:
   workflow_dispatch:
@@ -13,7 +13,7 @@ permissions:
   pull-requests: write
 
 env:
-  OPENAI_API_KEY: ${{ secrets.SKLEE_OPENAI_API_KEY }}
+  OPENAI_API_KEY: ${{ secrets.SKLEE_OPENAI_API_KEY || '' }}
   MAX_FILE_BYTES: "150000"
   MAX_FILES_TO_ANALYZE: "200"
 
@@ -32,144 +32,226 @@ jobs:
         with:
           python-version: '3.10'
 
-      - name: Install dependencies (semgrep, requests)
+      - name: Install dependencies (semgrep)
         run: |
           python -m pip install --upgrade pip
-          pip install semgrep requests
+          pip install semgrep
 
       - name: Run semgrep (builtin rules)
         run: |
           semgrep --config p/ci --json --output semgrep-results.json || true
-          echo "semgrep finished, results saved to semgrep-results.json (if any)"
+          echo "semgrep finished; semgrep-results.json written if any findings."
 
-      - name: Run external security script (if present)
-        id: run_script
+      - name: Create security_scan.py script (if not present)
         run: |
-          echo "----- START external security script step -----"
-          echo "Listing .github/scripts directory (if present):"
-          ls -la .github/scripts || true
+          mkdir -p .github/scripts
+          cat > .github/scripts/security_scan.py <<'PY'
+#!/usr/bin/env python3
+# security_scan.py
+# Generate a Korean formatted report.md from semgrep-results.json (and optional ai_summary_structured.json).
+import json, os, sys, datetime, html, re
 
-          if [ -f .github/scripts/security_scan.py ]; then
-            echo "security_scan.py FOUND - running..."
-            python .github/scripts/security_scan.py || echo "security_scan.py exited with non-zero"
-            echo "security_scan.py finished"
-          else
-            echo ".github/scripts/security_scan.py not found — relying on semgrep fallback report"
-          fi
+def load_json(path):
+    try:
+        with open(path, 'r', encoding='utf8') as f:
+            return json.load(f)
+    except Exception:
+        return None
 
-          if [ -f report.md ]; then
-            echo "report.md created; files_count: 1"
-          else
-            echo "report.md NOT found at root"
-          fi
+def normalize_sev(s):
+    if not s: return 'LOW'
+    s = str(s).lower()
+    if 'critical' in s or 'error' in s or 'high' in s: return 'CRITICAL'
+    if 'medium' in s or 'moderate' in s: return 'MEDIUM'
+    return 'LOW'
 
-          echo "----- END external security script step -----"
+# Simple heuristic mapping from keywords -> recommendation
+def recommend_for_message(msg):
+    m = msg.lower()
+    if 'sql' in m or 'execute' in m and 'statement' in m:
+        return "SQL 인젝션 위험: PreparedStatement(파라미터 바인딩)를 사용하여 입력을 쿼리와 분리하고, 입력 검증(화이트리스트)을 적용하세요."
+    if 'xpath' in m:
+        return "XPath 인젝션 위험: 사용자 입력을 사용하기 전에 적절히 이스케이프하거나 파라미터화하세요."
+    if 'ldap' in m:
+        return "LDAP 인젝션 위험: 파라미터화된 쿼리 또는 입력 이스케이프를 사용하세요."
+    if 'xss' in m or '<script' in m or 'html' in m and 'escape' not in m:
+        return "교차 사이트 스크립팅(XSS): 출력 시 HTML 인코딩(예: HtmlUtils.htmlEscape) 혹은 템플릿의 자동 이스케이프를 사용하세요."
+    if 'command' in m and 'exec' in m:
+        return "OS 명령 실행 취약: 외부 입력을 직접 명령으로 사용하지 마시고, 화이트리스트/밸리데이션 또는 안전한 API를 사용하세요."
+    # default
+    return "입력 검증(화이트리스트)과 출력 인코딩, 최소 권한 원칙 적용을 권고합니다."
 
-      - name: Debug & Force-post report (show report and post truncated)
+def map_cwe_from_msg(msg):
+    if not msg: return ''
+    msg = msg.upper()
+    m = re.search(r'CWE[-_ ]?(\d{1,4})', msg)
+    if m:
+        return 'CWE-' + m.group(1)
+    # keyword heuristics
+    if 'SQL' in msg: return 'CWE-89'
+    if 'XSS' in msg or 'SCRIPT' in msg: return 'CWE-79'
+    if 'LDAP' in msg: return 'CWE-90'
+    if 'XPATH' in msg: return 'CWE-643'
+    return ''
+
+def owasp_from_cwe(cwe):
+    # conservative mapping by category name (not A-number to avoid errors)
+    if not cwe: return ''
+    if cwe.startswith('CWE-89'): return 'Injection (OWASP 관련)'
+    if cwe.startswith('CWE-79'): return 'XSS (OWASP 관련)'
+    if cwe.startswith('CWE-90') or cwe.startswith('CWE-643'): return 'Injection/Injection-like (OWASP 관련)'
+    return ''
+
+def main():
+    sr = 'semgrep-results.json'
+    ai = 'ai_summary_structured.json'
+    out = 'report.md'
+
+    semgrep = load_json(sr) or {}
+    ai_summary = load_json(ai) or {}
+
+    results = semgrep.get('results', []) if isinstance(semgrep, dict) else []
+    findings = []
+    for r in results:
+        # semgrep result shape varies; normalize
+        path = r.get('path') or r.get('extra', {}).get('metadata', {}).get('file') or r.get('extra', {}).get('lines') or '-'
+        msg = (r.get('extra',{}).get('message') or r.get('message') or '').strip()
+        start = '-'
+        if isinstance(r.get('start'), dict):
+            start = r['start'].get('line','-')
+        elif r.get('start'):
+            start = r['start']
+        sev = r.get('extra',{}).get('severity') or r.get('severity') or ''
+        sevn = normalize_sev(sev)
+        cwe = map_cwe_from_msg(msg)
+        owasp = owasp_from_cwe(cwe)
+        rec = recommend_for_message(msg)
+        findings.append({
+            'file': path, 'line': start, 'severity': sevn, 'msg': msg, 'cwe': cwe, 'owasp': owasp, 'rec': rec
+        })
+
+    # If ai_summary has structured items, merge or prefer it
+    # ai_summary expected shape: {'items':[{'file':'...','line':X,'severity':'...','cwe':'CWE-...','msg':'...','rec':'...'}]}
+    if isinstance(ai_summary, dict) and ai_summary.get('items'):
+        for it in ai_summary.get('items',[]):
+            # prefer AI items if semgrep missed
+            findings.append({
+                'file': it.get('file','-'), 'line': it.get('line','-'),
+                'severity': normalize_sev(it.get('severity','')), 'msg': it.get('msg',''),
+                'cwe': it.get('cwe',''), 'owasp': owasp_from_cwe(it.get('cwe','')), 'rec': it.get('rec','')
+            })
+
+    # dedupe by file+line+msg
+    seen = set()
+    dedup = []
+    for f in findings:
+        key = (f['file'], str(f['line']), f['msg'][:200])
+        if key in seen: continue
+        seen.add(key)
+        dedup.append(f)
+    findings = dedup
+
+    # overall decision
+    overall = '취약점 없음 (자동 분석)'
+    if any(f['severity']=='CRITICAL' for f in findings):
+        overall = '취약점 있음 (Block)'
+    elif any(f['severity']=='MEDIUM' for f in findings):
+        overall = '수동 검토 필요'
+
+    # build markdown
+    lines = []
+    lines.append(f"# 🤖 AI Security Review (자동 리포트) - {datetime.date.today().isoformat()}")
+    lines.append("")
+    lines.append(f"**전체 판단:** {overall}")
+    lines.append("")
+    lines.append("**요약:**")
+    if findings:
+        lines.append(f"- 총 발견 항목: {len(findings)}")
+        crit = sum(1 for f in findings if f['severity']=='CRITICAL')
+        med = sum(1 for f in findings if f['severity']=='MEDIUM')
+        low = sum(1 for f in findings if f['severity']=='LOW')
+        lines.append(f"  - Critical: {crit}, Medium: {med}, Low: {low}")
+    else:
+        lines.append("- 탐지된 취약점 없음 (자동 분석 기준).")
+    lines.append("")
+    lines.append("## 상세 항목")
+    lines.append("")
+    if findings:
+        lines.append("|파일|라인|심각도|CWE|OWASP(연관)|문제 요약|권고(한글)|")
+        lines.append("|---|---:|---|---|---|---|---|")
+        for f in findings:
+            file_disp = f['file']
+            line_disp = f['line']
+            sev = f['severity']
+            cwe = f['cwe'] or '-'
+            owasp = f['owasp'] or '-'
+            msg = (f['msg'] or '-').replace('\n',' ').replace('|','\\|')
+            rec = (f['rec'] or '-').replace('\n',' ').replace('|','\\|')
+            lines.append(f"|{file_disp}|{line_disp}|{sev}|{cwe}|{owasp}|{msg}|{rec}|")
+    else:
+        lines.append("취약점 항목이 없습니다.")
+    lines.append("")
+    lines.append("## 권고 요약 (한글)")
+    if findings:
+        lines.append("- 각 항목별 권고를 위 표의 `권고(한글)` 열에서 확인하세요.")
+        lines.append("- 일반 권고: 입력 검증(화이트리스트), 출력 인코딩, 파라미터 바인딩(PreparedStatement), 최소 권한 적용.")
+    else:
+        lines.append("- 현재 자동 분석 기준으로는 취약점이 발견되지 않았습니다. 단, 수동 검토 필요 영역이 있을 수 있습니다.")
+    lines.append("")
+    lines.append("---")
+    lines.append("#### 원문(자동 생성)")
+    # optionally include AI summary text if present
+    if isinstance(ai_summary, dict) and ai_summary.get('original'):
+        lines.append("")
+        lines.append("```\n" + ai_summary.get('original')[:4000] + "\n```")
+    lines.append("")
+    lines.append("_자동 생성 리포트 — 담당자 검토 필요_")
+
+    with open(out, 'w', encoding='utf8') as fw:
+        fw.write('\n'.join(lines))
+
+    print(f"report.md created ({len(lines)} lines).")
+
+if __name__ == '__main__':
+    main()
+PY
+
+      - name: Run security_scan.py (generate report.md)
+        run: |
+          python .github/scripts/security_scan.py
+          echo "report.md generation attempted"
+          ls -la report.md || true
+          echo "report head:"
+          sed -n '1,120p' report.md || true
+
+      - name: Post report (PR comment or create Issue)
         uses: actions/github-script@v7
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           script: |
             const fs = require('fs');
-            const childExec = require('child_process').execSync;
-
-            core.info('=== WORKSPACE PWD ===');
-            try { core.info(childExec('pwd').toString()); } catch(e){ core.info(String(e)); }
-
-            core.info('=== LIST ROOT ===');
-            try { core.info(childExec('ls -la').toString()); } catch(e){ core.info(String(e)); }
-
-            core.info('=== LIST .github/scripts ===');
-            try { core.info(childExec('ls -la .github/scripts || true').toString()); } catch(e){ core.info(String(e)); }
-
-            // If no report.md, try to generate fallback from semgrep-results.json
-            if (!fs.existsSync('report.md')) {
-              core.info('report.md NOT found - attempting fallback creation from semgrep-results.json');
-              if (fs.existsSync('semgrep-results.json')) {
-                try {
-                  const txt = fs.readFileSync('semgrep-results.json','utf8');
-                  const data = JSON.parse(txt || '{}');
-                  const results = Array.isArray(data.results) ? data.results : [];
-                  let lines = [];
-                  lines.push('### 자동 보안 리포트 (fallback from semgrep)');
-                  lines.push('');
-                  if (results.length > 0) {
-                    lines.push('#### Semgrep 발견 항목:');
-                    for (let i=0;i<Math.min(200,results.length);i++) {
-                      const r = results[i];
-                      const path = r.path || (r.extra && r.extra.metadata && r.extra.metadata.file) || '-';
-                      const extra = r.extra || {};
-                      const msg = extra.message || r.message || '';
-                      let start = '-';
-                      if (r.start && typeof r.start === 'object') start = r.start.line || '-';
-                      else if (r.start) start = String(r.start);
-                      const sev = extra.severity || '';
-                      lines.push(`- ${path}:${start} [${sev}] ${msg}`);
-                    }
-                  } else {
-                    lines.push('- Semgrep: 문제 없음 (기본 룰).');
-                  }
-                  lines.push('');
-                  lines.push('_자동 리포트 — 담당자 검토 필요_');
-                  fs.writeFileSync('report.md', lines.join('\\n'), {encoding:'utf8'});
-                  core.info('Fallback report.md created.');
-                } catch(e) {
-                  core.info('Fallback creation failed: ' + String(e));
-                }
-              } else {
-                core.info('No semgrep-results.json available for fallback.');
-              }
-            } else {
-              core.info('report.md already exists in workspace root.');
-            }
-
-            // Show report.md head (for logs)
-            if (fs.existsSync('report.md')) {
-              const full = fs.readFileSync('report.md','utf8');
-              core.info('report.md size (chars): ' + full.length);
-              core.info('---- report.md head (first 4000 chars) ----');
-              core.info(full.slice(0,4000));
-              core.info('---- end head ----');
-            } else {
-              core.info('report.md STILL NOT found at workspace root after fallback attempts.');
-            }
-
-            // Prepare body (truncate if too long)
-            let body = fs.existsSync('report.md') ? fs.readFileSync('report.md','utf8') : 'No report generated.';
-            if (body.length > 8000) {
-              body = body.slice(0,8000) + '\n\n(리포트가 너무 길어 요약본만 게시되었습니다 - 전체는 artifact 참고)';
-            }
-
-            // Make API call and print response for diagnostics
+            const path = 'report.md';
+            const bodyFull = fs.existsSync(path) ? fs.readFileSync(path,'utf8') : 'No report generated.';
+            // Truncate for posting
+            const bodyToPost = (bodyFull.length > 8000) ? bodyFull.slice(0,8000) + '\n\n(리포트 요약만 게시됨; 전체는 artifact 참조)' : bodyFull;
             const isPR = !!context.payload.pull_request;
-            try {
-              if (isPR) {
-                const issue_number = context.payload.pull_request.number;
-                core.info(`Posting comment to PR #${issue_number}...`);
-                const resp = await github.rest.issues.createComment({
-                  owner: context.repo.owner,
-                  repo: context.repo.repo,
-                  issue_number,
-                  body: `### 🤖 AI Security Review (자동 요약)\n\n${body}\n\n_자동 생성 — 담당자 검토 필요_`
-                });
-                core.info('API response status: ' + (resp.status || 'unknown'));
-                core.info('API response data (keys): ' + Object.keys(resp.data || {}).join(', '));
-                core.info('Posted truncated report as PR comment');
-              } else {
-                core.info('Creating Issue with report (push context)...');
-                const resp = await github.rest.issues.create({
-                  owner: context.repo.owner,
-                  repo: context.repo.repo,
-                  title: `[AI Security Scan] 자동 리포트 - ${new Date().toISOString().slice(0,10)}`,
-                  body: `브랜치: ${context.ref}\n\n${body}\n\n_자동 생성 리포트_`
-                });
-                core.info('API response status: ' + (resp.status || 'unknown'));
-                core.info('API response data (keys): ' + Object.keys(resp.data || {}).join(', '));
-                core.info('Created issue with truncated report');
-              }
-            } catch(e) {
-              core.info('API call failed: ' + String(e));
-              try { core.info('Error detail: ' + JSON.stringify(e, Object.getOwnPropertyNames(e))); } catch(e2) {}
+            if (isPR) {
+              const issue_number = context.payload.pull_request.number;
+              const resp = await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number,
+                body: `### 🤖 AI Security Review (자동 요약)\n\n${bodyToPost}\n\n_자동 생성 — 담당자 검토 필요_`
+              });
+              core.info('Posted PR comment. API status: ' + (resp.status || 'unknown'));
+            } else {
+              const resp = await github.rest.issues.create({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                title: `[AI Security Scan] 자동 리포트 - ${new Date().toISOString().slice(0,10)}`,
+                body: `브랜치: ${context.ref}\n\n${bodyToPost}\n\n_자동 생성 리포트_`
+              });
+              core.info('Created issue. API status: ' + (resp.status || 'unknown'));
             }
 
       - name: Upload artifacts
@@ -179,7 +261,3 @@ jobs:
           path: |
             semgrep-results.json
             report.md
-            files_to_analyze.json
-            files_content.json
-            heuristics.json
-            ai_summary_structured.json
