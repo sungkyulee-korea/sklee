@@ -1,6 +1,5 @@
 name: Security AI Scan (robust + debug)
 
-# Trigger on push, PR and manual
 on:
   push:
     branches: ['**']
@@ -52,88 +51,82 @@ jobs:
 
       - name: Run semgrep (builtin rules)
         run: |
-          # Run baseline (public ci rules) and save results
           semgrep --config p/ci --json --output semgrep-results.json || true
-          echo "Saved semgrep-results.json (builtin)"
+          echo "semgrep builtin saved to semgrep-results.json"
 
-      - name: Run semgrep (repo custom rules, if any)
+      - name: Run semgrep (repo custom rules, if present)
         run: |
           if [ -d ".semgrep" ]; then
             semgrep --config .semgrep --json --output semgrep-custom.json || true
-            echo "Saved semgrep-custom.json (repo .semgrep rules)"
-            ls -la semgrep-custom.json || true
+            echo "semgrep custom saved to semgrep-custom.json"
           else
-            echo ".semgrep directory not found, skipping custom semgrep rules"
+            echo ".semgrep directory not found - skipping custom rules"
           fi
 
       - name: Run external security script (if present) OR create fallback report
         id: run_external
         run: |
-          echo "----- START external security script step -----"
-          echo "Listing .github/scripts directory (if present):"
+          echo "Listing .github/scripts"
           ls -la .github/scripts || true
 
           if [ -f .github/scripts/security_scan.py ]; then
-            echo "security_scan.py FOUND - running..."
+            echo "Found .github/scripts/security_scan.py - executing"
             python .github/scripts/security_scan.py || true
-            RC=$?
-            echo "security_scan.py exit code: $RC"
+            echo "external script completed"
           else
-            echo "security_scan.py not found — creating fallback report from semgrep JSON results"
+            echo "No external script - creating fallback report from semgrep outputs"
             python - <<'PY'
-import json, os, sys
-out = []
-had = False
-def add(s=''):
-    out.append(s)
-# Try custom semgrep first, then builtin
-files = ['semgrep-custom.json','semgrep-results.json']
+import json, os
+out_lines = []
+# load results from possible files
+files = ['semgrep-custom.json', 'semgrep-results.json']
 results = []
 for f in files:
     if os.path.exists(f):
         try:
-            j = json.load(open(f,encoding='utf8'))
-            res = j.get('results') if isinstance(j, dict) else []
-            if isinstance(res, list) and res:
-                results.extend(res)
+            j = json.load(open(f, encoding='utf8'))
+            if isinstance(j, dict):
+                res = j.get('results', [])
+                if isinstance(res, list):
+                    results.extend(res)
         except Exception:
             pass
 
-add("# 🤖 AI Security Review (자동 리포트)")
-add("")
+out_lines.append("# 🤖 AI Security Review (자동 리포트)")
+out_lines.append("")
 if results:
-    add("## 전체 판단: 취약점 탐지 (자동분석)")
-    add("")
-    add("### 발견 항목:")
+    out_lines.append("## 전체 판단: 취약점 탐지 (자동분석)")
+    out_lines.append("")
+    out_lines.append("### 발견 항목:")
     for r in results[:200]:
-        path = r.get('path') or r.get('extra',{}).get('metadata',{}).get('file','-')
-        msg = r.get('extra',{}).get('message') or r.get('message') or ''
-        sev = r.get('extra',{}).get('severity','')
+        path = r.get('path') or r.get('extra', {}).get('metadata', {}).get('file', '-')
+        extra = r.get('extra', {})
+        msg = extra.get('message') or r.get('message') or ''
+        sev = extra.get('severity', '')
         line = '-'
         start = r.get('start')
         if isinstance(start, dict):
-            line = start.get('line','-')
+            line = start.get('line', '-')
         elif start is not None:
-            line = start
-        add(f"- {path}:{line} ({sev}) - {msg}")
-    add("")
-    add("## 권고(간단)")
-    add("- 자동탐지 항목을 참고하여 해당 라인에서 PreparedStatement/파라미터 바인딩, 입력 검증, 출력 인코딩 등을 적용하세요.")
+            line = str(start)
+        out_lines.append(f"- {path}:{line} ({sev}) - {msg}")
+    out_lines.append("")
+    out_lines.append("## 권고(간단)")
+    out_lines.append("- 탐지된 항목을 바탕으로 해당 라인에서 안전한 API(PreparedStatement, 파라미터 바인딩 등)를 사용하거나 입력 검증/출력 인코딩을 적용하세요.")
 else:
-    add("## 전체 판단: 취약점 없음 (자동분석)")
-    add("")
-    add("- Semgrep 기본/커스텀 룰에서 취약점이 감지되지 않았습니다.")
-    add("- 자동분석은 한계가 있으므로 중요 로직은 수동 검토 권장.")
+    out_lines.append("## 전체 판단: 취약점 없음 (자동분석)")
+    out_lines.append("")
+    out_lines.append("- Semgrep 기본/커스텀 룰에서 취약점이 감지되지 않았습니다.")
+    out_lines.append("- 자동분석은 한계가 있으므로 중요 로직은 수동 검토 권장.")
 
-add("")
-add("_자동 생성 리포트 — 담당자 검토 필요_")
+out_lines.append("")
+out_lines.append("_자동 생성 리포트 — 담당자 검토 필요_")
 
-with open('report.md','w',encoding='utf8') as fw:
-    fw.write('\n'.join(out))
-print("report.md created; files_count: 1")
+with open('report.md', 'w', encoding='utf8') as fw:
+    fw.write('\n'.join(out_lines))
+print("report.md created")
 PY
           fi
-          echo "----- END external security script step -----"
 
       - name: Debug - print generated report (first 200 lines)
         run: |
@@ -152,7 +145,6 @@ PY
             const path = 'report.md';
             const report = fs.existsSync(path) ? fs.readFileSync(path,'utf8') : null;
             const isPR = !!context.payload.pull_request;
-            // If PR, post comment under PR; otherwise create an issue
             if (isPR) {
               await github.rest.issues.createComment({
                 owner: context.repo.owner,
@@ -168,8 +160,8 @@ PY
                 body: `브랜치: ${context.ref}\n\n${report || 'No report generated.'}\n\n_자동 생성 리포트_`
               });
             }
-            // Output a short summary to the job log
-            console.log("Posted report (PR? " + (isPR? "yes":"no") + ")");
+            console.log("Posted report (PR? " + (isPR ? "yes" : "no") + ")")
+
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
