@@ -1,12 +1,10 @@
 #!/usr/bin/env python3
 # .github/scripts/security_scan.py
-# Purpose: create report.md (always) from semgrep-results.json and optionally call OpenAI for summary.
-# Requirements: requests (installed in workflow). Save this file as .github/scripts/security_scan.py
+# Always creates report.md. Optionally calls OpenAI if OPENAI key present.
+# Save as: .github/scripts/security_scan.py
 
 import os
-import sys
 import json
-import time
 import traceback
 
 WORKDIR = os.getcwd()
@@ -61,14 +59,13 @@ def build_fallback_report(findings):
     return "\n".join(lines)
 
 def call_openai_for_summary(semgrep_text, files_list):
-    # lazy import requests
     try:
         import requests
     except Exception as e:
         return {"error": f"requests not available: {e}"}
 
-    system = "You are a concise security-focused code reviewer. Provide JSON with overall/items/summary_kr and then a short Korean markdown."
-    user = "SEMgrep summary (short):\n" + semgrep_text + "\n\nFILES (list):\n" + "\n".join(files_list[:200]) + "\n\nPlease return JSON first then a short Korean markdown summary."
+    system = "You are a concise security-focused code reviewer. Provide JSON with overall/items/summary_kr and then a short Korean markdown summary."
+    user = "SEMgrep summary (short):\n" + (semgrep_text[:12000] if semgrep_text else "(empty)") + "\n\nFILES (list):\n" + "\n".join(files_list[:200]) + "\n\nPlease return JSON first then a short Korean markdown summary."
 
     body = {
         "model": OPENAI_MODEL,
@@ -97,13 +94,12 @@ def main():
         findings = load_semgrep_results()
         fallback = build_fallback_report(findings)
 
-        # gather small file list for context (names only)
+        # small file list for context (names)
         files_list = []
         for root, dirs, files in os.walk("."):
             for fn in files:
                 if fn.endswith((".java", ".py", ".js", ".yml", ".yaml")):
-                    path = os.path.join(root, fn)
-                    files_list.append(path)
+                    files_list.append(os.path.join(root, fn))
             if len(files_list) > 200:
                 break
 
@@ -111,7 +107,7 @@ def main():
         if os.path.exists(SEMGREP_FILE):
             try:
                 sem_text = open(SEMGREP_FILE, "r", encoding="utf8").read()
-            except:
+            except Exception:
                 sem_text = ""
 
         ai_note = "\n\n---\n\n(OpenAI 요약 없음)"
@@ -130,7 +126,7 @@ def main():
         else:
             ai_note = "\n\n---\n\n(OpenAI 키가 설정되지 않아 AI 요약은 생략됨.)"
 
-        # write report.md ALWAYS
+        # always write report.md
         try:
             with open(OUT_MD, "w", encoding="utf8") as fw:
                 fw.write(fallback)
@@ -158,7 +154,6 @@ def main():
                     fw.write("# AI Security Scan (fallback)\n\n스크립트 실행 중 오류가 발생했습니다. 수동 확인 필요.\n")
         except:
             pass
-        sys.exit(0)
 
 if __name__ == "__main__":
     main()
