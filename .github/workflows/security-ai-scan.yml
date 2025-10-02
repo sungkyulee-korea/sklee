@@ -1,26 +1,18 @@
-name: Security AI Scan (KR report + post)
+name: Security AI Scan (minimal, validated)
 
 on:
-  workflow_dispatch:
-  pull_request:
-    types: [opened, synchronize, reopened]
   push:
     branches: ['**']
+  pull_request:
+    types: [opened, synchronize, reopened]
+  workflow_dispatch:
 
 permissions:
   contents: read
-  issues: write
-  pull-requests: write
-
-env:
-  OPENAI_API_KEY: ${{ secrets.SKLEE_OPENAI_API_KEY }}
-  MAX_FILE_BYTES: "150000"
-  MAX_FILES_TO_ANALYZE: "200"
 
 jobs:
-  security-scan:
+  semgrep-scan:
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -37,136 +29,13 @@ jobs:
           python -m pip install --upgrade pip
           pip install semgrep
 
-      - name: Run semgrep (builtin rules, safe)
+      - name: Run semgrep (builtin rules)
         run: |
           semgrep --config p/ci --json --output semgrep-results.json || true
           echo "semgrep finished; semgrep-results.json written (if any findings)."
 
-      - name: Ensure scripts dir exists
-        run: |
-          mkdir -p .github/scripts
-          ls -la .github || true
-
-      - name: Generate report.md from semgrep results
-        run: |
-          # Use a safe inline Python heredoc (no YAML interpolation issues)
-          python - <<'PY'
-import json, os, datetime, re, sys
-def load_json(p):
-    try:
-        with open(p,'r',encoding='utf8') as f:
-            return json.load(f)
-    except Exception:
-        return {}
-
-def norm_sev(s):
-    if not s: return 'LOW'
-    s = str(s).lower()
-    if 'critical' in s or 'error' in s or 'high' in s: return 'CRITICAL'
-    if 'medium' in s or 'moderate' in s: return 'MEDIUM'
-    return 'LOW'
-
-def map_cwe(msg):
-    if not msg: return ''
-    m = re.search(r'cwe[-_ ]?(\d+)', msg, re.I)
-    if m: return 'CWE-' + m.group(1)
-    low = msg.lower()
-    if 'sql' in low: return 'CWE-89'
-    if 'xss' in low: return 'CWE-79'
-    if 'ldap' in low: return 'CWE-90'
-    if 'xpath' in low: return 'CWE-643'
-    return ''
-
-sr = 'semgrep-results.json'
-out = 'report.md'
-data = load_json(sr)
-results = data.get('results', []) if isinstance(data, dict) else []
-
-findings = []
-for r in results:
-    path = r.get('path') or (r.get('extra',{}).get('metadata') or {}).get('file') or '-'
-    msg = (r.get('extra',{}).get('message') or r.get('message') or '').strip()
-    start = '-'
-    if isinstance(r.get('start'), dict):
-        start = r['start'].get('line','-')
-    elif r.get('start'):
-        start = r.get('start')
-    sev = r.get('extra',{}).get('severity') or r.get('severity') or ''
-    findings.append({'file': path, 'line': start, 'severity': norm_sev(sev), 'msg': msg, 'cwe': map_cwe(msg)})
-
-overall = '취약점 없음 (자동 분석)'
-if any(f['severity']=='CRITICAL' for f in findings):
-    overall = '취약점 있음 (Block)'
-elif any(f['severity']=='MEDIUM' for f in findings):
-    overall = '수동 검토 필요'
-
-lines = []
-lines.append(f"# 🤖 AI Security Review (자동 리포트) - {datetime.date.today().isoformat()}")
-lines.append("")
-lines.append(f"**전체 판단:** {overall}")
-lines.append("")
-lines.append("## 상세 항목")
-lines.append("")
-
-if findings:
-    lines.append("|파일|라인|심각도|CWE|문제 요약|")
-    lines.append("|---|---:|---|---|---|")
-    for f in findings:
-        file_disp = f['file']
-        line_disp = f['line']
-        sev = f['severity']
-        cwe = f['cwe'] or '-'
-        msg = (f['msg'] or '-').replace("\n"," ").replace("|","\\|")
-        lines.append(f"|{file_disp}|{line_disp}|{sev}|{cwe}|{msg}|")
-else:
-    lines.append("- 탐지된 항목이 없습니다.")
-
-lines.append("")
-lines.append("## 권고 요약")
-if findings:
-    lines.append("- 각 항목별로 PreparedStatement(파라미터 바인딩), 입력 검증, 출력 인코딩 등 권고를 적용하세요.")
-else:
-    lines.append("- 자동분석으로는 취약점 없음. 단, 수동 검토 권장.")
-
-with open(out,'w',encoding='utf8') as fo:
-    fo.write("\n".join(lines))
-
-print("report.md created.")
-PY
-          ls -la report.md || true
-          sed -n '1,120p' report.md || true
-
-      - name: Post report (PR comment or create Issue)
-        uses: actions/github-script@v7
-        with:
-          github-token: ${{ secrets.GITHUB_TOKEN }}
-          script: |
-            const fs = require('fs');
-            const path = 'report.md';
-            const bodyFull = fs.existsSync(path) ? fs.readFileSync(path,'utf8') : 'No report generated.';
-            const bodyToPost = (bodyFull.length > 8000) ? bodyFull.slice(0,8000) + '\n\n(리포트 요약만 게시됨; 전체는 artifact 참조)' : bodyFull;
-            const isPR = !!context.payload.pull_request;
-            if (isPR) {
-              const issue_number = context.payload.pull_request.number;
-              await github.rest.issues.createComment({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                issue_number,
-                body: `### 🤖 AI Security Review (자동 요약)\n\n${bodyToPost}\n\n_자동 생성 — 담당자 검토 필요_`
-              });
-            } else {
-              await github.rest.issues.create({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                title: `[AI Security Scan] 자동 리포트 - ${new Date().toISOString().slice(0,10)}`,
-                body: `브랜치: ${context.ref}\n\n${bodyToPost}\n\n_자동 생성 리포트_`
-              });
-            }
-
-      - name: Upload artifacts
+      - name: Upload semgrep results artifact
         uses: actions/upload-artifact@v4
         with:
-          name: security-scan-artifacts
-          path: |
-            semgrep-results.json
-            report.md
+          name: semgrep-results
+          path: semgrep-results.json
