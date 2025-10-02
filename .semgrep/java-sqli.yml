@@ -1,7 +1,7 @@
 rules:
   - id: java-sqli-string-concat
     languages: [java]
-    message: "Possible SQL injection: concatenated SQL passed to executeQuery()/executeUpdate(). Use PreparedStatement with parameters."
+    message: "Possible SQL injection: concatenated SQL passed to executeQuery()/executeUpdate(). Use PreparedStatement."
     severity: ERROR
     pattern: $ST.executeQuery($SQL)
     pattern-inside: |
