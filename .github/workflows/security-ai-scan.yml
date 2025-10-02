@@ -13,7 +13,7 @@ permissions:
   pull-requests: write
 
 env:
-  OPENAI_API_KEY: ${{ secrets.SKLEE_OPENAI_API_KEY || '' }}
+  OPENAI_API_KEY: ${{ secrets.SKLEE_OPENAI_API_KEY }}
   MAX_FILE_BYTES: "150000"
   MAX_FILES_TO_ANALYZE: "200"
 
@@ -27,7 +27,7 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Setup Python 3.10
+      - name: Setup Python
         uses: actions/setup-python@v4
         with:
           python-version: '3.10'
@@ -37,23 +37,21 @@ jobs:
           python -m pip install --upgrade pip
           pip install semgrep
 
-      - name: Run semgrep (builtin rules)
+      - name: Run semgrep (builtin rules, safe)
         run: |
           semgrep --config p/ci --json --output semgrep-results.json || true
-          echo "semgrep finished; semgrep-results.json written if any findings."
+          echo "semgrep finished; semgrep-results.json written (if any findings)."
 
       - name: Ensure scripts dir exists
         run: |
           mkdir -p .github/scripts
           ls -la .github || true
 
-      - name: Create security_scan.py script
+      - name: Generate report.md from semgrep results
         run: |
-          cat > .github/scripts/security_scan.py <<'PY'
-#!/usr/bin/env python3
-# Minimal generator: read semgrep-results.json and produce report.md (Korean table)
-import json, os, datetime, re
-
+          # Use a safe inline Python heredoc (no YAML interpolation issues)
+          python - <<'PY'
+import json, os, datetime, re, sys
 def load_json(p):
     try:
         with open(p,'r',encoding='utf8') as f:
@@ -71,12 +69,12 @@ def norm_sev(s):
 def map_cwe(msg):
     if not msg: return ''
     m = re.search(r'cwe[-_ ]?(\d+)', msg, re.I)
-    if m:
-        return 'CWE-' + m.group(1)
-    if 'sql' in msg.lower(): return 'CWE-89'
-    if 'xss' in msg.lower(): return 'CWE-79'
-    if 'ldap' in msg.lower(): return 'CWE-90'
-    if 'xpath' in msg.lower(): return 'CWE-643'
+    if m: return 'CWE-' + m.group(1)
+    low = msg.lower()
+    if 'sql' in low: return 'CWE-89'
+    if 'xss' in low: return 'CWE-79'
+    if 'ldap' in low: return 'CWE-90'
+    if 'xpath' in low: return 'CWE-643'
     return ''
 
 sr = 'semgrep-results.json'
@@ -86,7 +84,7 @@ results = data.get('results', []) if isinstance(data, dict) else []
 
 findings = []
 for r in results:
-    path = r.get('path') or (r.get('extra',{}).get('metadata') or {}).get('file') or r.get('path', '-')
+    path = r.get('path') or (r.get('extra',{}).get('metadata') or {}).get('file') or '-'
     msg = (r.get('extra',{}).get('message') or r.get('message') or '').strip()
     start = '-'
     if isinstance(r.get('start'), dict):
@@ -94,9 +92,7 @@ for r in results:
     elif r.get('start'):
         start = r.get('start')
     sev = r.get('extra',{}).get('severity') or r.get('severity') or ''
-    findings.append({
-        'file': path, 'line': start, 'severity': norm_sev(sev), 'msg': msg, 'cwe': map_cwe(msg)
-    })
+    findings.append({'file': path, 'line': start, 'severity': norm_sev(sev), 'msg': msg, 'cwe': map_cwe(msg)})
 
 overall = '취약점 없음 (자동 분석)'
 if any(f['severity']=='CRITICAL' for f in findings):
@@ -111,6 +107,7 @@ lines.append(f"**전체 판단:** {overall}")
 lines.append("")
 lines.append("## 상세 항목")
 lines.append("")
+
 if findings:
     lines.append("|파일|라인|심각도|CWE|문제 요약|")
     lines.append("|---|---:|---|---|---|")
@@ -136,13 +133,6 @@ with open(out,'w',encoding='utf8') as fo:
 
 print("report.md created.")
 PY
-          chmod +x .github/scripts/security_scan.py
-          echo "script created at .github/scripts/security_scan.py"
-
-      - name: Run security_scan.py (generate report.md)
-        run: |
-          python .github/scripts/security_scan.py || true
-          echo "report.md generation attempted"
           ls -la report.md || true
           sed -n '1,120p' report.md || true
 
@@ -164,7 +154,6 @@ PY
                 issue_number,
                 body: `### 🤖 AI Security Review (자동 요약)\n\n${bodyToPost}\n\n_자동 생성 — 담당자 검토 필요_`
               });
-              core.info('Posted PR comment');
             } else {
               await github.rest.issues.create({
                 owner: context.repo.owner,
@@ -172,7 +161,6 @@ PY
                 title: `[AI Security Scan] 자동 리포트 - ${new Date().toISOString().slice(0,10)}`,
                 body: `브랜치: ${context.ref}\n\n${bodyToPost}\n\n_자동 생성 리포트_`
               });
-              core.info('Created issue with report');
             }
 
       - name: Upload artifacts
