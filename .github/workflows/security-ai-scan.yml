@@ -5,6 +5,7 @@ on:
     branches: ['**']
   pull_request:
     types: [opened, synchronize, reopened]
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -12,9 +13,8 @@ permissions:
   pull-requests: write
 
 env:
-  # 등록한 시크릿 이름을 사용하세요
   OPENAI_API_KEY: ${{ secrets.SKLEE_OPENAI_API_KEY }}
-  MAX_POST_CHARS: "1800"       # 이슈/코멘트로 보낼 최대 바이트 수 (조정 가능)
+  MAX_POST_CHARS: "1800"
   MAX_FILES_TO_ANALYZE: "200"
   MAX_FILE_BYTES: "150000"
 
@@ -28,7 +28,7 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Setup Python 3.x
+      - name: Setup Python
         uses: actions/setup-python@v4
         with:
           python-version: '3.10'
@@ -48,7 +48,7 @@ jobs:
         id: run_semgrep_custom
         run: |
           if [ -f .semgrep.yml ] || [ -f .semgrep.yaml ]; then
-            semgrep --config .semgrep.yml --json --output semgrep-custom.json || true
+            semgrep --config .semgrep.yml --json --output semgrep-custom.json || semgrep --config .semgrep.yaml --json --output semgrep-custom.json || true
             ls -la semgrep-custom.json || true
           else
             echo "no custom semgrep config"
@@ -65,7 +65,6 @@ jobs:
             echo "No external script - building fallback report.md from semgrep outputs"
             python - <<'PY'
 import json, os, sys
-out = "report.md"
 results = []
 for fname in ("semgrep-custom.json","semgrep-results.json"):
     if os.path.exists(fname):
@@ -98,8 +97,10 @@ else:
 
 lines.append("")
 lines.append("_전체 리포트는 artifact로 보관됩니다._")
-with open(out, "w", encoding="utf8") as fw:
+
+with open("report.md", "w", encoding="utf8") as fw:
     fw.write("\n".join(lines))
+
 print("report.md created")
 PY
           fi
@@ -110,40 +111,34 @@ PY
           ls -la report.md || true
           echo "=== report.md size (bytes) ==="
           wc -c report.md || true
-          echo "=== show first 200 lines of report.md ==="
+          echo "=== report.md head (first 200 lines) ==="
           sed -n '1,200p' report.md || true
           echo "=== semgrep files listing ==="
           ls -la semgrep-results.json semgrep-custom.json || true
-          echo "=== artifact candidate files ==="
-          for f in report.md semgrep-results.json semgrep-custom.json; do
-            if [ -f "$f" ]; then echo "$f -> $(wc -c < $f) bytes"; fi
-          done
 
       - name: Prepare short summary to post
         id: prepare_short
         run: |
           SHORT=post_body_short.md
-          # Make a short version (first 400 lines), then truncate by bytes
           if [ -f report.md ]; then
             head -n 400 report.md > /tmp/_tmp_head.md || true
             dd if=/tmp/_tmp_head.md of=$SHORT bs=1 count=${{ env.MAX_POST_CHARS }} status=none || true
-            echo "Prepared $SHORT (bytes: $(wc -c < $SHORT))"
+            echo "Prepared $SHORT ($(wc -c < $SHORT || true) bytes)"
           else
             echo "자동 리포트가 생성되지 않았습니다. 아티팩트를 확인하세요." > $SHORT
             echo "Prepared fallback $SHORT"
           fi
-          echo "::notice::SHORT prepared: $(wc -c < $SHORT || true) bytes"
 
-      - name: Debug: show short body (first 200 chars)
+      - name: Debug: show short body (preview)
         run: |
           SHORT=post_body_short.md
-          echo "=== post_body_short.md head (200 chars) ==="
+          echo "=== short preview (200 chars) ==="
           head -c 200 $SHORT || true
           echo
-          echo "=== full short file (up to 200 lines) ==="
-          sed -n '1,200p' $SHORT || true
+          echo "=== short file first 80 lines ==="
+          sed -n '1,80p' $SHORT || true
 
-      - name: Post report (PR comment or Issue) - with debug logging
+      - name: Post report (PR comment or create Issue) - unified
         id: post_report
         uses: actions/github-script@v7
         with:
@@ -158,16 +153,14 @@ PY
             } else {
               body = '자동 리포트가 생성되지 않았습니다. 아티팩트를 확인하세요.';
             }
-            // Add header with detection summary
             const header = `### 🤖 AI Security Review (자동 리포트)\n\n`;
             const summary = header + body + `\n\n_자동 생성 리포트 — 담당자 검토 필요_`;
 
             console.log("Event name:", context.event_name);
-            console.log("Is pull_request payload present:", !!context.payload.pull_request);
+            console.log("Has pull_request payload:", !!context.payload.pull_request);
 
             try {
               if (context.event_name === 'pull_request' && context.payload.pull_request) {
-                // Post as PR comment
                 const prNum = context.payload.pull_request.number;
                 console.log("Posting PR comment on PR#", prNum);
                 const res = await github.rest.issues.createComment({
@@ -176,10 +169,9 @@ PY
                   issue_number: prNum,
                   body: summary
                 });
-                console.log("PR comment created:", res.data.html_url);
-                return { posted: 'pr_comment', url: res.data.html_url };
+                console.log("PR comment created:", res.data && res.data.html_url);
+                return { posted: 'pr_comment', url: res.data && res.data.html_url };
               } else {
-                // For push (or other), create an issue
                 const title = `[AI Security Scan] 자동 리포트 - ${new Date().toISOString().slice(0,10)}`;
                 console.log("Creating Issue with title:", title);
                 const res = await github.rest.issues.create({
@@ -188,14 +180,13 @@ PY
                   title: title,
                   body: summary
                 });
-                console.log("Issue created:", res.data.html_url);
-                return { posted: 'issue', url: res.data.html_url };
+                console.log("Issue created:", res.data && res.data.html_url);
+                return { posted: 'issue', url: res.data && res.data.html_url };
               }
             } catch (err) {
               console.log("POST ERROR:", err && err.message ? err.message : err);
-              // Attempt to post condensed fallback (very small) if original failed
               try {
-                const tiny = "자동 리포트 생성은 실패했습니다. 아티팩트(report.md)를 확인하세요.";
+                const tiny = "자동 리포트 게시 실패. 아티팩트를 확인하세요.";
                 if (context.event_name === 'pull_request' && context.payload.pull_request) {
                   await github.rest.issues.createComment({
                     owner: context.repo.owner,
@@ -208,11 +199,11 @@ PY
                   const res2 = await github.rest.issues.create({
                     owner: context.repo.owner,
                     repo: context.repo.repo,
-                    title: `[AI Security Scan] 보고서 업로드 실패 - ${new Date().toISOString().slice(0,10)}`,
+                    title: `[AI Security Scan] 게시 실패 - ${new Date().toISOString().slice(0,10)}`,
                     body: tiny
                   });
-                  console.log("Fallback issue created:", res2.data.html_url);
-                  return { posted: 'issue_fallback', url: res2.data.html_url };
+                  console.log("Fallback issue created:", res2.data && res2.data.html_url);
+                  return { posted: 'issue_fallback', url: res2.data && res2.data.html_url };
                 }
               } catch (err2) {
                 console.log("Fallback post also failed:", err2 && err2.message ? err2.message : err2);
@@ -229,4 +220,3 @@ PY
             post_body_short.md
             semgrep-results.json
             semgrep-custom.json
-
