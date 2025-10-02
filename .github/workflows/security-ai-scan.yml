@@ -1,4 +1,4 @@
-name: Security AI Scan (robust + debug)
+name: Security AI Scan (robust + debug + truncate-safe post)
 
 on:
   push:
@@ -60,6 +60,7 @@ jobs:
           OPENAI_MODEL: ${{ env.OPENAI_MODEL }}
           GITHUB_REPOSITORY: ${{ github.repository }}
           GITHUB_EVENT_PATH: ${{ github.event_path }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
 
       - name: Debug: show generated report (head)
         run: |
@@ -72,7 +73,7 @@ jobs:
           echo "---- semgrep-results.json head ----"
           if [ -f semgrep-results.json ]; then sed -n '1,200p' semgrep-results.json; else echo "(no semgrep-results.json)"; fi
 
-      - name: Debug & Force-create issue (detailed)
+      - name: Debug & Force-create issue (truncate-safe)
         if: ${{ always() }}
         env:
           GITHUB_API_URL: https://api.github.com
@@ -82,49 +83,67 @@ jobs:
         run: |
           set -euo pipefail
           owner_repo="${GITHUB_REPOSITORY}"
+          run_id="${GITHUB_RUN_ID:-}"
           echo "Repository: $owner_repo"
+          echo "GITHUB_RUN_ID: ${run_id:-(none)}"
           echo "GITHUB_EVENT_NAME: ${GITHUB_EVENT_NAME:-(none)}"
           echo "GITHUB_EVENT_PATH: ${GITHUB_EVENT_PATH:-(none)}"
 
-          # pick report body
+          # pick report text (truncate head)
+          REPORT_TEXT=""
           if [ -f "$REPORT_PATH" ]; then
             echo "FOUND report: $REPORT_PATH (size=$(stat -c%s "$REPORT_PATH"))"
-            report_body=$(sed -n '1,1000p' "$REPORT_PATH" | sed 's/"/\\"/g' | awk '{printf "%s\\n",$0}')
+            REPORT_TEXT=$(sed -n '1,15000p' "$REPORT_PATH" || true)
           elif [ -f "$ALT_REPORT" ]; then
             echo "FOUND alt report: $ALT_REPORT (size=$(stat -c%s "$ALT_REPORT"))"
-            report_body=$(sed -n '1,1000p' "$ALT_REPORT" | sed 's/"/\\"/g' | awk '{printf "%s\\n",$0}')
+            REPORT_TEXT=$(sed -n '1,15000p' "$ALT_REPORT" || true)
           else
             echo "No report file found. Will post debug summary."
-            report_body="No report file found. Workspace listing:\\n$(ls -la | sed 's/\"/\\\\\"/g' | awk '{printf \"%s\\n\",$0}')"
+            REPORT_TEXT="No report file found. Workspace listing:\\n$(ls -la | sed 's/\"/\\\\\"/g' | awk '{printf \"%s\\n\",$0}')"
           fi
 
-          echo "== Checking repository metadata (has_issues) =="
-          repo_resp=$(curl -sS -H "Authorization: Bearer ${GITHUB_TOKEN}" -H "Accept: application/vnd.github+json" "${GITHUB_API_URL}/repos/${owner_repo}")
-          echo "Repo metadata (truncated):"
-          echo "${repo_resp}" | sed -n '1,200p' || true
-          has_issues=$(echo "${repo_resp}" | python -c "import sys,json;print(json.load(sys.stdin).get('has_issues'))" || echo "unknown")
-          echo "has_issues: ${has_issues}"
+          TRUNC_LIMIT=30000
+          SHORT_BODY="$(printf "%s" "$REPORT_TEXT" | tr -d '\r' | sed 's/"/\\"/g' | cut -c -${TRUNC_LIMIT})"
+          ARTIFACT_LINK="https://github.com/${owner_repo}/actions/runs/${run_id}/artifacts"
+          FOOTER="\n\n(Full report saved as an artifact for this run: ${ARTIFACT_LINK})"
 
-          # determine if this is a PR event
+          ISSUE_TITLE="[AI Security Scan] 자동 리포트 - $(date -I)"
+          ISSUE_BODY="$(printf "%s\n\n%s" "$SHORT_BODY" "$FOOTER" | sed 's/"/\\"/g')"
+
+          # detect PR number from event
           PR_NUM=""
           if [ -n "${GITHUB_EVENT_PATH:-}" ] && [ -f "${GITHUB_EVENT_PATH}" ]; then
-            PR_NUM=$(python -c "import json,sys; j=json.load(open(sys.argv[1])); pr=j.get('pull_request',{}); print(pr.get('number',''))" "${GITHUB_EVENT_PATH}" 2>/dev/null || true)
+            PR_NUM=$(python - <<'PY'
+import json,sys
+try:
+  ev=json.load(open(sys.argv[1]))
+  pr=ev.get("pull_request")
+  if pr:
+    print(pr.get("number",""))
+  else:
+    print("")
+except:
+  print("")
+PY
+ "${GITHUB_EVENT_PATH}" 2>/dev/null || true)
           fi
           echo "PR_NUM: ${PR_NUM:-(none)}"
 
-          # prepare payload
-          ISSUE_TITLE="[DEBUG][AI Security Scan] 자동 리포트 - $(date -I)"
-          BODY_JSON=$(printf '{"title":"%s","body":"%s"}' "${ISSUE_TITLE}" "${report_body}")
-
           if [ -n "${PR_NUM}" ]; then
-            echo "Posting as PR comment to issue number ${PR_NUM}"
+            echo "Posting as PR comment to #${PR_NUM}..."
             POST_URL="${GITHUB_API_URL}/repos/${owner_repo}/issues/${PR_NUM}/comments"
-            resp=$(curl -sS -w "\n%{http_code}" -X POST -H "Authorization: Bearer ${GITHUB_TOKEN}" -H "Accept: application/vnd.github+json" -H "Content-Type: application/json" "${POST_URL}" -d "$(printf '{"body":"%s"}' "${report_body}")" ) || true
+            JSON_PAYLOAD=$(printf '{"body":"%s"}' "${ISSUE_BODY}")
           else
-            echo "Creating Issue"
+            echo "Creating issue..."
             POST_URL="${GITHUB_API_URL}/repos/${owner_repo}/issues"
-            resp=$(curl -sS -w "\n%{http_code}" -X POST -H "Authorization: Bearer ${GITHUB_TOKEN}" -H "Accept: application/vnd.github+json" -H "Content-Type: application/json" "${POST_URL}" -d "${BODY_JSON}" ) || true
+            JSON_PAYLOAD=$(printf '{"title":"%s","body":"%s"}' "${ISSUE_TITLE}" "${ISSUE_BODY}")
           fi
+
+          resp=$(curl -sS -w "\n%{http_code}" -X POST \
+            -H "Authorization: Bearer ${GITHUB_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            -H "Content-Type: application/json" \
+            "${POST_URL}" -d "${JSON_PAYLOAD}" ) || true
 
           http_code=$(echo "$resp" | tail -n1)
           resp_body=$(echo "$resp" | sed '$d')
@@ -134,9 +153,10 @@ jobs:
 
           if [ "$http_code" -ge 200 ] && [ "$http_code" -lt 300 ]; then
             echo "Post succeeded."
+            echo "Artifact link (view when signed-in): ${ARTIFACT_LINK}"
           else
-            echo "Post failed. See above response_body for reason."
-            echo "Possible causes: Issues disabled, GITHUB_TOKEN lacks permission, organization policy blocking, payload invalid."
+            echo "Post failed. See above response body for details."
+            echo "Possible causes: Issues disabled (has_issues=false), GITHUB_TOKEN lacks permission, organization policy blocking, body/payload validation (too long or invalid chars)."
             exit 1
           fi
 
