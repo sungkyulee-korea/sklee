@@ -1,9 +1,11 @@
 # .github/scripts/security_scan.py
-import json, os, sys
+# Create report.md and post_body_short.md from semgrep outputs.
+# This script is intentionally simple and robust (no external AI calls by default).
+import os, json
 
-MAX_POST_BYTES = int(os.environ.get("MAX_POST_CHARS", "1800"))
+MAX_POST_CHARS = int(os.environ.get("MAX_POST_CHARS", "1800"))
 
-def load(fname):
+def load_semgrep(fname):
     if not os.path.exists(fname):
         return []
     try:
@@ -11,21 +13,19 @@ def load(fname):
             j = json.load(f)
         if isinstance(j, dict) and "results" in j:
             return j.get("results", [])
+        # older/other shapes
+        return j if isinstance(j, list) else []
     except Exception:
-        pass
-    return []
+        return []
 
 results = []
-results += load("semgrep-results.json")
-results += load("semgrep-custom.json")
+results += load_semgrep("semgrep-custom.json")
+results += load_semgrep("semgrep-results.json")
 
-lines = []
-lines.append("# 자동 보안 리포트 (Semgrep 기반)")
-lines.append("")
-
+lines = ["# 자동 보안 리포트 (Semgrep 초안)", ""]
 if results:
     lines.append("## 발견 항목 (요약)")
-    for r in results[:300]:
+    for r in results[:200]:
         path = r.get("path") or r.get("extra", {}).get("metadata", {}).get("file", "-")
         extra = r.get("extra") or {}
         msg = extra.get("message") or r.get("message") or ""
@@ -42,13 +42,14 @@ else:
 lines.append("")
 lines.append("_전체 리포트는 artifact로 보관됩니다._")
 
+# write full report
 with open("report.md", "w", encoding="utf8") as fw:
     fw.write("\n".join(lines))
 
-# short file for posting to issue/comment
-short_text = "\n".join(lines[:60])
-b = short_text.encode("utf8")[:MAX_POST_BYTES]
+# prepare short post body: first ~60 lines, truncated to MAX_POST_CHARS bytes
+head_text = "\n".join(lines[:60])
+b = head_text.encode("utf8")[:MAX_POST_CHARS]
 with open("post_body_short.md", "wb") as fo:
     fo.write(b)
 
-print("report.md and post_body_short.md created (entries: %d)" % len(results))
+print("report.md and post_body_short.md created; findings:", len(results))
