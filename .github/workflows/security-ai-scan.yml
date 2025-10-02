@@ -13,17 +13,13 @@ permissions:
   pull-requests: write
 
 env:
-  MAX_DIFF_CHARS: "90000"
-  SKIP_LARGE_FILES_BYTES: "150000"
-  # OpenAI key must be provided via repository secret SKLEE_OPENAI_API_KEY
+  MAX_FILE_BYTES: "200000"     # 개별 파일 최대 바이트(넘으면 스킵)
+  MAX_FILES: "8"               # 최대 포함할 파일 수
+  MAX_CHARS_TOTAL: "30000"     # OpenAI에 보낼 최대 문자수 대략
 
 jobs:
   security-scan:
     runs-on: ubuntu-latest
-    env:
-      OPENAI_API_KEY: ${{ secrets.SKLEE_OPENAI_API_KEY }}
-      MAX_DIFF_CHARS: ${{ env.MAX_DIFF_CHARS }}
-      SKIP_LARGE_FILES_BYTES: ${{ env.SKIP_LARGE_FILES_BYTES }}
 
     steps:
       - name: Checkout repository
@@ -31,244 +27,232 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Setup Python 3.10
+      - name: Setup Python (for semgrep)
         uses: actions/setup-python@v4
         with:
           python-version: '3.10'
 
-      - name: Install semgrep and requests
+      - name: Install semgrep
         run: |
           python -m pip install --upgrade pip
-          pip install semgrep requests
+          pip install semgrep
 
       - name: Run semgrep (builtin rules)
         run: |
           semgrep --config p/ci --json --output semgrep-results.json || true
-          echo "semgrep builtin done -> semgrep-results.json"
+          echo "semgrep finished"
 
-      - name: Run semgrep (repo .semgrep rules if present)
-        run: |
-          if [ -d ".semgrep" ] || [ -f ".semgrep.yml" ] || [ -f ".semgrep" ]; then
-            # try local config
-            if [ -f .semgrep.yml ]; then
-              semgrep --config .semgrep.yml --json --output semgrep-custom.json || true
-              echo "semgrep custom (.semgrep.yml) -> semgrep-custom.json"
-            elif [ -d .semgrep ]; then
-              semgrep --config .semgrep --json --output semgrep-custom.json || true
-              echo "semgrep custom (.semgrep dir) -> semgrep-custom.json"
-            else
-              echo "no custom semgrep config file/directory"
-            fi
-          else
-            echo "no .semgrep config present"
-          fi
-
-      - name: Run external security script (if present)
-        run: |
-          echo "Listing .github/scripts"
-          ls -la .github/scripts || true
-
-          if [ -f .github/scripts/security_scan.py ]; then
-            echo "Running .github/scripts/security_scan.py"
-            python .github/scripts/security_scan.py || true
-            echo "external script done"
-          else
-            echo "no .github/scripts/security_scan.py - nothing to run"
-          fi
-
-      - name: Call OpenAI and post report (semgrep + files -> OpenAI -> post comment/issue)
+      - name: Call OpenAI + Post report (comment on PR or create Issue)
         uses: actions/github-script@v7
+        env:
+          OPENAI_API_KEY: ${{ secrets.SKLEE_OPENAI_API_KEY }}
+          MAX_FILE_BYTES: ${{ env.MAX_FILE_BYTES }}
+          MAX_FILES: ${{ env.MAX_FILES }}
+          MAX_CHARS_TOTAL: ${{ env.MAX_CHARS_TOTAL }}
         with:
           script: |
             const fs = require('fs');
             const path = require('path');
 
-            // READ semgrep results (if present)
-            let semgrepResults = [];
-            const candFiles = ['semgrep-custom.json','semgrep-results.json'];
-            for (const f of candFiles) {
-              if (fs.existsSync(f)) {
-                try {
-                  const j = JSON.parse(fs.readFileSync(f,'utf8'));
-                  if (Array.isArray(j.results)) semgrepResults = semgrepResults.concat(j.results);
-                } catch (e) {}
-              }
-            }
+            // helper
+            function truncate(s, n) { return s.length > n ? s.slice(0,n) + "\n\n[...truncated]" : s; }
 
-            // Pick candidate files to show to OpenAI
-            const filesSet = new Set();
-            for (const r of semgrepResults) {
-              const p = r.path || (r.extra && r.extra.metadata && r.extra.metadata.file);
-              if (p) filesSet.add(p);
-            }
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const isPR = !!context.payload.pull_request;
+            let changedFiles = [];
 
-            if (filesSet.size === 0) {
-              // try find CWE*bad.java files first or some .java files (limit)
-              function scanDir(dir, limit = 8) {
-                try {
-                  const entries = fs.readdirSync(dir, { withFileTypes: true });
-                  for (const e of entries) {
-                    const full = path.join(dir, e.name);
-                    if (e.isDirectory()) {
-                      if (['.git','node_modules','build','dist'].includes(e.name)) continue;
-                      scanDir(full, limit);
-                      if (filesSet.size >= limit) return;
-                    } else if (e.isFile()) {
-                      if (/CWE.*_bad\.java$/i.test(e.name) || e.name.endsWith('.java')) {
-                        filesSet.add(path.relative(process.cwd(), full));
-                        if (filesSet.size >= limit) return;
-                      }
-                    }
-                  }
-                } catch (e) {}
-              }
-              scanDir(process.cwd(), 8);
-            }
-
-            // limit files
-            const chosenFiles = Array.from(filesSet).slice(0, 8);
-
-            // read content with size limit
-            const perFiles = [];
-            const maxChars = parseInt(process.env.MAX_DIFF_CHARS || '90000', 10);
-            for (const fname of chosenFiles) {
-              try {
-                const st = fs.statSync(fname);
-                if (st.size > parseInt(process.env.SKIP_LARGE_FILES_BYTES || '150000',10)) continue;
-                const raw = fs.readFileSync(fname,'utf8');
-                const perLimit = Math.max(1000, Math.floor(maxChars / Math.max(1, chosenFiles.length)));
-                perFiles.push({ filename: fname, content: raw.slice(0, perLimit) });
-              } catch (e) {}
-            }
-
-            // semgrep summary text
-            let semgrepSummary = '';
-            if (semgrepResults.length > 0) {
-              semgrepSummary += `Semgrep findings (${semgrepResults.length}):\n`;
-              for (const r of semgrepResults.slice(0,50)) {
-                const p = r.path || (r.extra && r.extra.metadata && r.extra.metadata.file) || 'unknown';
-                const line = (r.start && r.start.line) ? r.start.line : '-';
-                const msg = (r.extra && r.extra.message) ? r.extra.message : (r.message || '');
-                semgrepSummary += `- ${p}:${line} - ${msg}\n`;
-              }
-            } else {
-              semgrepSummary = 'No semgrep findings (or semgrep JSON missing).';
-            }
-
-            // build prompt (Korean)
-            const system = "You are a concise security-focused code reviewer. Provide structured JSON then a Korean markdown report.";
-            let user = "다음 정보를 보안 관점에서 점검하세요. 응답 형식: JSON 먼저, 그 다음 한글 마크다운 보고서.\n";
-            user += "JSON 필드: { overall: 'Block'|'Manual review'|'Low', items: [{file,line,severity,title,cwe,owasp,description,one_line_fix}], summary_kr }\n\n";
-            user += "SEMgrep SUMMARY:\n" + semgrepSummary + "\n\n";
-            user += "FILES:\n";
-            for (const f of perFiles) {
-              user += `--- FILE: ${f.filename} ---\n${f.content}\n\n`;
-            }
-            user += "\n주의: 취약점이 확실하면 overall을 'Block'으로 하며, 관련 CWE/OWASP 분류를 포함하세요. 탐지가 애매하면 'Manual review'로 표기하고 이유를 설명하세요.\n";
-
-            // prepare openai request
-            const apiKey = process.env.OPENAI_API_KEY || '';
-            if (!apiKey) {
-              fs.writeFileSync('ai_report_openai.md', '# ERROR: OPENAI_API_KEY not set\n', 'utf8');
-              return;
-            }
-
-            const body = {
-              model: "gpt-4o-mini",
-              messages: [
-                { role: "system", content: system },
-                { role: "user", content: user }
-              ],
-              temperature: 0,
-              max_tokens: 1500
-            };
-
-            // call OpenAI
+            // 1) determine changed files (PR vs push compare)
             try {
-              const resp = await fetch("https://api.openai.com/v1/chat/completions", {
-                method: "POST",
-                headers: {
-                  "Authorization": `Bearer ${apiKey}`,
-                  "Content-Type": "application/json"
-                },
-                body: JSON.stringify(body)
-              });
-
-              const text = await resp.text();
-              if (!resp.ok) {
-                fs.writeFileSync('ai_report_openai.md', `# OpenAI Error (status ${resp.status})\n\n${text}`, 'utf8');
+              if (isPR) {
+                const prnum = context.payload.pull_request.number;
+                const list = await github.rest.pulls.listFiles({ owner, repo, pull_number: prnum, per_page: 250 });
+                changedFiles = list.data.map(f => f.filename);
               } else {
-                const j = JSON.parse(text);
-                const content = j.choices && j.choices[0] && j.choices[0].message && j.choices[0].message.content
-                  ? j.choices[0].message.content
-                  : JSON.stringify(j, null, 2);
-                fs.writeFileSync('ai_summary.txt', content, 'utf8');
-
-                // try extract first JSON object
-                let jsonObj = null;
-                try {
-                  const m = content.match(/\{[\s\S]*\}/);
-                  if (m) jsonObj = JSON.parse(m[0]);
-                } catch (e) { jsonObj = null; }
-
-                if (jsonObj) {
-                  let md = "### AI Security Review (자동)\n\n";
-                  md += `**전체 판단:** ${jsonObj.overall || 'Manual review'}\n\n`;
-                  if (Array.isArray(jsonObj.items) && jsonObj.items.length) {
-                    md += "### 발견 항목\n";
-                    for (const it of jsonObj.items) {
-                      md += `- ${it.file || '-'}:${it.line || '-'} (${it.severity || '-'}) — ${it.title || '-'}\n`;
-                      md += `  - CWE: ${it.cwe || '-'}; OWASP: ${it.owasp || '-'}\n`;
-                      md += `  - 한줄수정: ${it.one_line_fix || '-'}\n`;
-                    }
-                    md += "\n";
-                  } else {
-                    md += "- 취약점 항목 없음(자동 판정)\n\n";
-                  }
-                  md += "### 권고\n";
-                  md += (jsonObj.summary_kr || '자동 요약 없음') + "\n";
-                  fs.writeFileSync('ai_report_openai.md', md, 'utf8');
-                  fs.writeFileSync('ai_summary_structured.json', JSON.stringify(jsonObj, null, 2), 'utf8');
+                const before = context.payload.before;
+                const after = context.payload.after;
+                if (before && after && before !== '0000000000000000000000000000000000000000') {
+                  const comp = await github.rest.repos.compareCommits({ owner, repo, base: before, head: after });
+                  changedFiles = (comp.data.files || []).map(f => f.filename);
                 } else {
-                  // raw output as fallback
-                  fs.writeFileSync('ai_report_openai.md', "# AI Review (raw)\n\n" + content, 'utf8');
+                  // fallback: list tree
+                  const tree = await github.rest.git.getTree({ owner, repo, tree_sha: context.sha, recursive: "1" }).catch(()=>({ data:{ tree:[] } }));
+                  changedFiles = (tree.data.tree || []).filter(t=>t.type==='blob').map(t=>t.path);
                 }
               }
             } catch (e) {
-              fs.writeFileSync('ai_report_openai.md', '# OpenAI fetch failed\n\n' + String(e), 'utf8');
+              core && core.error && core.error("Error enumerating files: " + String(e));
             }
 
-            // Now post: if PR then comment else create issue
-            const reportPath = fs.existsSync('ai_report_openai.md') ? 'ai_report_openai.md' : (fs.existsSync('report.md') ? 'report.md' : null);
-            const reportBody = reportPath ? fs.readFileSync(reportPath,'utf8') : 'No report generated';
+            // limit and prioritize suspicious filenames (CWE*bad.java first)
+            const prioritized = [];
+            const others = [];
+            for (const f of changedFiles) {
+              if (/CWE.*_bad\.java$/i.test(f)) prioritized.push(f);
+              else others.push(f);
+            }
+            const candidates = prioritized.concat(others).slice(0, parseInt(process.env.MAX_FILES||'8',10));
 
-            const isPR = !!context.payload.pull_request;
-            if (isPR) {
-              await github.rest.issues.createComment({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                issue_number: context.payload.pull_request.number,
-                body: `### 🤖 AI Security Review (자동 리포트)\n\n${reportBody}\n\n_자동 생성 — 담당자 검토 필요_`
-              });
+            // 2) read contents (with size guard)
+            const filesPayload = [];
+            const maxBytes = parseInt(process.env.MAX_FILE_BYTES || '200000', 10);
+            const maxCharsTotal = parseInt(process.env.MAX_CHARS_TOTAL || '30000', 10);
+            let charsLeft = maxCharsTotal;
+
+            for (const relPath of candidates) {
+              try {
+                const resp = await github.rest.repos.getContent({ owner, repo, path: relPath, ref: context.sha });
+                if (!resp || !resp.data) continue;
+                // handle file content (base64)
+                if (resp.data.type !== 'file') continue;
+                const encoding = resp.data.encoding || 'base64';
+                let raw = Buffer.from(resp.data.content || '', encoding).toString('utf8');
+                if (Buffer.byteLength(raw,'utf8') > maxBytes) {
+                  // skip large
+                  continue;
+                }
+                // truncate per-file based on remaining chars
+                const take = Math.max(200, Math.floor(charsLeft / Math.max(1, candidates.length)));
+                const excerpt = truncate(raw, take);
+                charsLeft -= excerpt.length;
+                filesPayload.push({ filename: relPath, excerpt: excerpt });
+              } catch (err) {
+                // file may be binary or removed, skip
+                continue;
+              }
+            }
+
+            // 3) semgrep summary (optional)
+            let semgrepSummary = '';
+            if (fs.existsSync('semgrep-results.json')) {
+              try {
+                const s = JSON.parse(fs.readFileSync('semgrep-results.json','utf8'));
+                const results = s.results || [];
+                if (results.length > 0) {
+                  semgrepSummary += `Semgrep findings (${results.length}):\n`;
+                  for (const r of results.slice(0,50)) {
+                    const p = r.path || (r.extra && r.extra.metadata && r.extra.metadata.file) || '-';
+                    const line = (r.start && r.start.line) ? r.start.line : '-';
+                    const msg = (r.extra && r.extra.message) ? r.extra.message : (r.message || '');
+                    semgrepSummary += `- ${p}:${line} - ${msg}\n`;
+                  }
+                } else {
+                  semgrepSummary = "Semgrep: no findings (builtin rules).";
+                }
+              } catch (e) { semgrepSummary = "Semgrep: parse error"; }
             } else {
-              await github.rest.issues.create({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                title: `[AI Security Scan] 자동 리포트 - ${new Date().toISOString().slice(0,10)}`,
-                body: `브랜치: ${context.ref}\n\n${reportBody}\n\n_자동 생성 리포트_`
-              });
+              semgrepSummary = "Semgrep: not run or results missing.";
             }
-            // done
 
-      - name: Debug: show reports and attempt force-create issue (diagnose)
+            // 4) build prompt
+            let prompt = "You are a concise security-focused code reviewer. Provide JSON result then a Korean markdown report.\n";
+            prompt += "Format JSON first: { overall: 'Block'|'Manual review'|'Low', items:[{file,line,severity,title,cwe,owasp,description,one_line_fix}], summary_kr }\n\n";
+            prompt += "SEMgrep SUMMARY:\n" + semgrepSummary + "\n\n";
+            prompt += "FILES (excerpts):\n";
+            for (const f of filesPayload) {
+              prompt += `--- ${f.filename} ---\n${f.excerpt}\n\n`;
+            }
+            if (filesPayload.length===0) prompt += "(no file excerpts available)\n";
+
+            // 5) call OpenAI
+            const apiKey = process.env.OPENAI_API_KEY || '';
+            let aiContent = '';
+            if (!apiKey) {
+              aiContent = "ERROR: OPENAI_API_KEY not set";
+            } else {
+              try {
+                const resp = await fetch("https://api.openai.com/v1/chat/completions", {
+                  method: "POST",
+                  headers: {
+                    "Authorization": `Bearer ${apiKey}`,
+                    "Content-Type": "application/json"
+                  },
+                  body: JSON.stringify({
+                    model: "gpt-4o-mini",
+                    messages: [
+                      { role: "system", content: "You are a concise security-focused code reviewer." },
+                      { role: "user", content: prompt }
+                    ],
+                    max_tokens: 1200,
+                    temperature: 0
+                  })
+                });
+
+                const txt = await resp.text();
+                if (!resp.ok) {
+                  aiContent = `[OpenAI error ${resp.status}]\n` + txt.slice(0,3000);
+                } else {
+                  const j = JSON.parse(txt);
+                  aiContent = (j.choices && j.choices[0] && j.choices[0].message && j.choices[0].message.content) ? j.choices[0].message.content : txt;
+                }
+              } catch (e) {
+                aiContent = "OpenAI fetch failed: " + String(e);
+              }
+            }
+
+            // save report files
+            try { fs.writeFileSync('ai_summary.txt', aiContent, 'utf8'); } catch(e){}
+
+            // try to extract JSON block at front
+            let structured = null;
+            try {
+              const m = aiContent.match(/\{[\s\S]*\}/);
+              if (m) structured = JSON.parse(m[0]);
+            } catch(e) { structured = null; }
+
+            // build final markdown to post
+            let md = "## AI Security Review (자동)\n\n";
+            if (structured) {
+              md += `**전체 판단:** ${structured.overall || 'Manual review'}\n\n`;
+              if (structured.items && structured.items.length) {
+                md += "### 발견 항목\n";
+                for (const it of structured.items) {
+                  md += `- ${it.file || '-'}:${it.line || '-'} (${it.severity||'-'}) - ${it.title||'-'}\n`;
+                  md += `  - CWE: ${it.cwe||'-'}, OWASP: ${it.owasp||'-'}\n  - 한줄수정: ${it.one_line_fix||'-'}\n`;
+                }
+              } else {
+                md += "- 취약점 항목 없음(자동 판정)\n\n";
+              }
+              md += "\n### 권고 요약\n" + (structured.summary_kr || "_자동 요약 없음_") + "\n\n";
+            } else {
+              md += "### Raw AI output\n\n```\n" + aiContent.slice(0,3000) + "\n```\n\n";
+            }
+
+            // 6) post to PR or create issue
+            try {
+              if (isPR) {
+                await github.rest.issues.createComment({
+                  owner, repo,
+                  issue_number: context.payload.pull_request.number,
+                  body: md + "\n\n_자동 생성 — 담당자 검토 필요_"
+                });
+                console.log("Posted PR comment.");
+              } else {
+                const issue = await github.rest.issues.create({
+                  owner, repo,
+                  title: `[AI Security Scan] 자동 리포트 - ${new Date().toISOString().slice(0,10)}`,
+                  body: `브랜치: ${context.ref}\n\n${md}\n\n_자동 생성 리포트_`
+                });
+                console.log("Created issue number:", issue.data.number);
+              }
+            } catch (err) {
+              console.log("Post to GitHub failed:", String(err));
+              // rethrow to make step fail visibly
+              throw err;
+            }
+
+            // write ai_report_openai.md
+            try { fs.writeFileSync('ai_report_openai.md', md, 'utf8'); } catch(e){}
+            return;
+      
+      - name: Debug: show report files + try force-create issue (diagnose)
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          echo "=== workspace top ==="
+          echo "=== workspace listing ==="
           ls -la | sed -n '1,200p' || true
-
-          echo "=== Check report files ==="
-          for f in ai_report_openai.md report.md ai_summary.txt ai_summary_structured.json semgrep-results.json semgrep-custom.json; do
+          echo "=== check created files ==="
+          for f in ai_report_openai.md ai_summary.txt report.md semgrep-results.json; do
             if [ -f "$f" ]; then
               echo "FOUND: $f size=$(stat -c%s "$f")"
               echo "---- head of $f ----"
@@ -277,38 +261,28 @@ jobs:
             else
               echo "MISSING: $f"
             fi
-            echo "-----------------------------"
+            echo "--------------------------------"
           done
 
-          REPORT_FILE=""
-          if [ -f ai_report_openai.md ]; then REPORT_FILE="ai_report_openai.md"; elif [ -f report.md ]; then REPORT_FILE="report.md"; fi
-
-          if [ -z "$REPORT_FILE" ]; then
-            echo "No report file to post. Exiting debug step."
-            exit 0
-          fi
-
-          echo "Attempting to create issue via REST API using GITHUB_TOKEN..."
-          BODY=$(sed -n '1,800p' "$REPORT_FILE" | sed 's/"/\\"/g' | awk '{printf "%s\\n",$0}')
-          API_URL="https://api.github.com/repos/${GITHUB_REPOSITORY}/issues"
-          echo "API_URL=$API_URL"
-
-          RESP=$(curl -sS -w "\n%{http_code}" -X POST \
-            -H "Authorization: Bearer ${GITHUB_TOKEN}" \
-            -H "Accept: application/vnd.github+json" \
-            "${API_URL}" \
-            -d "{\"title\":\"[DEBUG][AI Security Scan] 자동 리포트 - $(date -I)\",\"body\":\"${BODY}\"}" ) || true
-
-          CODE=$(echo "$RESP" | tail -n1)
-          BODYR=$(echo "$RESP" | sed '$d')
-          echo "HTTP_CODE: $CODE"
-          echo "RESPONSE_BODY:"
-          echo "$BODYR" | sed -n '1,200p'
-          if [ "$CODE" -ge 200 ] && [ "$CODE" -lt 300 ]; then
-            echo "Force-create issue succeeded."
+          # If ai_report_openai.md exists, try to create an issue (debug) using GITHUB_TOKEN
+          if [ -f ai_report_openai.md ]; then
+            echo "Attempting to create debug issue..."
+            BODY=$(sed -n '1,1000p' ai_report_openai.md | sed 's/"/\\"/g' | awk '{printf "%s\\n",$0}')
+            API="https://api.github.com/repos/${GITHUB_REPOSITORY}/issues"
+            RESP=$(curl -s -w "\n%{http_code}" -X POST -H "Authorization: Bearer ${GITHUB_TOKEN}" -H "Accept: application/vnd.github+json" "$API" -d "{\"title\":\"[DEBUG] AI Security Scan - $(date -I)\",\"body\":\"${BODY}\"}") || true
+            CODE=$(echo "$RESP" | tail -n1)
+            BODYR=$(echo "$RESP" | sed '$d')
+            echo "HTTP_CODE: $CODE"
+            echo "RESPONSE_BODY:"
+            echo "$BODYR" | sed -n '1,300p'
+            if [ "$CODE" -ge 200 ] && [ "$CODE" -lt 300 ]; then
+              echo "Issue created successfully (debug)."
+            else
+              echo "Issue creation failed (debug). Check permission / token / repo settings."
+              exit 1
+            fi
           else
-            echo "Force-create issue failed. See RESPONSE_BODY above for details."
-            exit 1
+            echo "No AI report file to post; skipping force-create issue."
           fi
 
       - name: Upload artifacts
@@ -317,9 +291,5 @@ jobs:
           name: security-scan-artifacts
           path: |
             semgrep-results.json
-            semgrep-custom.json
-            semgrep-results.json
-            report.md
-            ai_report_openai.md
             ai_summary.txt
-            ai_summary_structured.json
+            ai_report_openai.md
