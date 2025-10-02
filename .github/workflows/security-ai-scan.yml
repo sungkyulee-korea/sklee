@@ -1,4 +1,4 @@
-name: Security AI Scan (semgrep + AI summary)
+name: Security AI Scan (unified post)
 
 on:
   push:
@@ -14,11 +14,12 @@ permissions:
 
 env:
   OPENAI_API_KEY: ${{ secrets.SKLEE_OPENAI_API_KEY }}
-  MAX_TRUNCATE_CHARS: "1800"   # 이슈/코멘트로 보낼 최대 문자 수 (필요시 조정)
+  MAX_POST_CHARS: 1800
+  MAX_FILES_TO_ANALYZE: "200"
+  MAX_FILE_BYTES: "150000"
 
 jobs:
   security-scan:
-    name: security-scan
     runs-on: ubuntu-latest
 
     steps:
@@ -35,234 +36,194 @@ jobs:
       - name: Install dependencies (semgrep, requests)
         run: |
           python -m pip install --upgrade pip
-          pip install semgrep requests
+          pip install semgrep requests || true
 
       - name: Run semgrep (builtin rules)
+        id: semgrep_builtin
         run: |
-          set -e
+          echo "Running semgrep builtin rules..."
           semgrep --config p/ci --json --output semgrep-results.json || true
-          echo "semgrep finished, results saved to semgrep-results.json (if any)"
-        shell: bash
+          echo "semgrep builtin complete"
+          ls -la semgrep-results.json || true
+
+      - name: Run semgrep (custom .semgrep.yml if present)
+        id: semgrep_custom
+        run: |
+          if [ -f .semgrep.yml ] || [ -f .semgrep.yaml ]; then
+            echo "Found custom semgrep config - running"
+            semgrep --config .semgrep.yml --json --output semgrep-custom.json || semgrep --config .semgrep.yaml --json --output semgrep-custom.json || true
+            ls -la semgrep-custom.json || true
+          else
+            echo "No custom semgrep config found - skipping"
+          fi
 
       - name: Run external security script (if present)
         id: run_script
         run: |
-          set -e
           echo "----- START external security script step -----"
-          echo "Listing .github/scripts directory (if present):"
+          echo "Listing .github/scripts (if present):"
           ls -la .github/scripts || true
 
+          # If user script present, run it (script should write report.md or other outputs)
           if [ -f .github/scripts/security_scan.py ]; then
-            echo "security_scan.py FOUND - running..."
-            python .github/scripts/security_scan.py || true
-            echo "security_scan.py finished; return code $?"
+            echo "Running .github/scripts/security_scan.py"
+            python .github/scripts/security_scan.py || echo "external script failed (non-zero exit) - continuing"
+            echo "external script done"
           else
-            echo ".github/scripts/security_scan.py not found — generating fallback report from semgrep-results.json"
-            python - <<'PY' || true
+            echo "No external script - creating fallback report.md from semgrep results"
+            python - <<'PY'
 import json, os, sys
-out = 'report.md'
+out = "report.md"
 lines = []
 try:
-    sr = 'semgrep-results.json'
+    sr = "semgrep-results.json"
     results = []
+    if os.path.exists("semgrep-custom.json"):
+        with open("semgrep-custom.json","r",encoding="utf8") as f:
+            j = json.load(f)
+            if isinstance(j, dict) and "results" in j:
+                results += j.get("results",[])
     if os.path.exists(sr):
-        with open(sr, 'r', encoding='utf8') as f:
-            data = json.load(f)
-        if isinstance(data, dict):
-            results = data.get('results', []) or []
-        else:
-            results = []
-    lines.append("# 자동 보안 리포트 (간단 요약)")
+        with open(sr,"r",encoding="utf8") as f:
+            j = json.load(f)
+            if isinstance(j, dict) and "results" in j:
+                results += j.get("results",[])
+    lines.append("# 자동 보안 리포트 (Semgrep 기반 초안)")
     lines.append("")
     if results:
-        lines.append("## Semgrep 발견 항목:")
+        lines.append("## 발견 항목 요약")
         for r in results[:200]:
-            path = r.get('path') or r.get('extra', {}).get('metadata', {}).get('file', '-')
-            extra = r.get('extra', {})
-            msg = extra.get('message') or r.get('message') or ''
+            path = r.get('path') or r.get('extra',{}).get('metadata',{}).get('file','-')
+            extra = r.get('extra',{})
+            msg = extra.get('message') or r.get('message','')
             start = '-'
             if isinstance(r.get('start'), dict):
-                start = r.get('start').get('line', '-')
+                start = r.get('start').get('line','-')
             else:
-                start = r.get('start', '-')
-            sev = extra.get('severity', 'UNSPECIFIED')
+                start = r.get('start','-')
+            sev = extra.get('severity','UNKNOWN')
             lines.append(f"- {path}:{start} [{sev}] {msg}")
     else:
-        lines.append("- Semgrep: 문제 없음 (기본 룰).")
+        lines.append("- Semgrep: 문제 없음 (기본/커스텀 룰 기준).")
     lines.append("")
-    lines.append("_자동 리포트 — 담당자 검토 필요_")
-    with open(out, 'w', encoding='utf8') as fw:
-        fw.write('\n'.join(lines))
-    print('Fallback report.md created')
+    lines.append("전체 리포트는 artifact로 보관됩니다. (자동 생성 — 담당자 검토 필요)")
+    with open(out,"w",encoding="utf8") as fw:
+        fw.write("\n".join(lines))
+    print("Fallback report.md created")
 except Exception as e:
-    print('Failed to create fallback report:', e)
+    print("Failed to create fallback report:", e)
     sys.exit(0)
 PY
           fi
           echo "----- END external security script step -----"
-        shell: bash
 
-      - name: Call OpenAI to enhance report (optional - safe)
-        id: call_openai
-        env:
-          OPENAI_API_KEY: ${{ env.OPENAI_API_KEY }}
+      - name: Prepare post body and truncation (post_body.md)
+        id: prepare_post
         run: |
           set -e
-          echo "Calling OpenAI to generate ai_summary.md (if OPENAI_API_KEY present)..."
-          python - <<'PY' || true
-import os, json, sys, textwrap, requests
-
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY") or ""
-out_full = "ai_summary.md"
-out_trunc = "ai_summary_trunc.md"
-max_chars = 4000
-
-if not OPENAI_API_KEY:
-    print("OPENAI_API_KEY not set - skipping AI call")
-    # create a small marker file
-    with open(out_full, "w", encoding="utf8") as f:
-        f.write("OPENAI_API_KEY not set - AI summary skipped.\n")
-    with open(out_trunc, "w", encoding="utf8") as f:
-        f.write("AI skipped (no API key).")
-    sys.exit(0)
-
-# Build prompt from semgrep results (or report.md)
-report_text = ""
-if os.path.exists("report.md"):
-    report_text = open("report.md", "r", encoding="utf8").read()
-elif os.path.exists("semgrep-results.json"):
-    try:
-        data = json.load(open("semgrep-results.json","r",encoding="utf8"))
-        results = data.get("results", []) if isinstance(data, dict) else []
-        lines = []
-        for r in results[:100]:
-            path = r.get('path') or r.get('extra', {}).get('metadata', {}).get('file', '-')
-            extra = r.get('extra', {})
-            msg = extra.get('message') or r.get('message') or ''
-            start = r.get('start', {})
-            line_no = start.get('line') if isinstance(start, dict) else start
-            lines.append(f"{path}:{line_no} - {msg}")
-        report_text = "Semgrep findings:\\n" + "\\n".join(lines)
-    except Exception as e:
-        report_text = f"Failed reading semgrep results: {e}"
-
-prompt = (
-    "You are a concise security reviewer. Given the following raw scan/report, "
-    "produce a short Korean summary (3-6 bullet lines) listing: 전체 판단 (취약점 있음/없음), "
-    "발견된 취약점의 CWE/종류(가능하면), 간단 설명(어떤 부분이 문제인지), 그리고 권고(한줄).\n\n"
-    "RAW REPORT:\\n" + report_text
-)
-
-# Call OpenAI Chat Completion endpoint (chat/completions)
-url = "https://api.openai.com/v1/chat/completions"
-headers = {
-    "Authorization": f"Bearer {OPENAI_API_KEY}",
-    "Content-Type": "application/json",
-}
-body = {
-    "model": "gpt-4o-mini",
-    "messages": [
-        {"role":"system", "content":"You are a concise security-focused code reviewer."},
-        {"role":"user", "content": prompt}
-    ],
-    "max_tokens": 800,
-    "temperature": 0
-}
-
-try:
-    r = requests.post(url, headers=headers, data=json.dumps(body), timeout=30)
-    text = ""
-    if r.status_code == 200:
-        j = r.json()
-        text = j.get("choices", [{}])[0].get("message", {}).get("content", "")
-        if not text:
-            text = "No summary generated (empty response)."
-    else:
-        text = f"[OpenAI error {r.status_code}] {r.text[:1500]}"
-except Exception as e:
-    text = f"[OpenAI request failed] {e}"
-
-# write outputs
-with open(out_full, "w", encoding="utf8") as f:
-    f.write(text)
-# truncated version for posting
-with open(out_trunc, "w", encoding="utf8") as f:
-    snippet = text[:max_chars]
-    f.write(snippet)
-print("AI summary files written:", out_full, out_trunc)
-PY
-        shell: bash
-
-      - name: Prepare truncated post body and debug
-        id: prep_post
-        run: |
-          set -e
-          TRUNC_LIMIT=${{ env.MAX_TRUNCATE_CHARS }}
-          # prefer ai_summary_trunc.md -> ai_summary.md -> report.md
-          if [ -f ai_summary_trunc.md ] && [ -s ai_summary_trunc.md ]; then
-            cp ai_summary_trunc.md post_body.md || true
-          elif [ -f ai_summary.md ] && [ -s ai_summary.md ]; then
-            head -c $TRUNC_LIMIT ai_summary.md > post_body.md || true
-          elif [ -f report.md ] && [ -s report.md ]; then
-            head -c $TRUNC_LIMIT report.md > post_body.md || true
+          # prefer external report.md if present
+          if [ -f report.md ]; then
+            echo "Using report.md"
+            cp report.md post_body_full.md
           else
-            echo "자동 리포트가 생성되지 않았습니다." > post_body.md
+            echo "No report.md found: creating simple summary"
+            echo "# AI Security Review (요약)" > post_body_full.md
+            echo "" >> post_body_full.md
+            # Try to include first lines from semgrep results
+            if [ -f semgrep-results.json ]; then
+              echo "Semgrep findings preview:" >> post_body_full.md
+              jq -r '.results[] | "- " + (.path // .extra.metadata.file // "-") + ":" + ((.start.line // .start) | tostring) + " - " + (.extra.message // .message // "")' semgrep-results.json | sed -n '1,20p' >> post_body_full.md || true
+            fi
+            echo "" >> post_body_full.md
+            echo "_전체 리포트는 artifact로 보관됩니다._" >> post_body_full.md
           fi
-          echo "---- debug: post_body.md size ----"
-          wc -c post_body.md || true
-          echo "---- preview of post_body.md (first 800 chars) ----"
-          head -c 800 post_body.md || true
-        shell: bash
 
-      - name: Post report (PR comment or create Issue) - unified
-        uses: actions/github-script@v7
-        with:
-          script: |
-            const fs = require('fs');
-            const path = 'post_body.md';
-            const content = fs.existsSync(path) ? fs.readFileSync(path,'utf8') : '';
-            const isPR = !!context.payload.pull_request;
-            const owner = context.repo.owner;
-            const repo = context.repo.repo;
-            if (isPR) {
-              const prNumber = context.payload.pull_request.number;
-              console.log(`Posting comment to PR #${prNumber}`);
-              const res = await github.rest.issues.createComment({
-                owner,
-                repo,
-                issue_number: prNumber,
-                body: `### 🤖 AI Security Review (자동 요약)\n\n${content}\n\n_전체 리포트는 artifact(attachments)로 남겼습니다._`
-              });
-              console.log("Comment API result:", res.status || (res.data && res.data.id));
-            } else {
-              console.log("No PR detected - creating Issue with summary");
-              const title = `[AI Security Scan] 자동 리포트 - ${new Date().toISOString().slice(0,10)}`;
-              const res = await github.rest.issues.create({
-                owner,
-                repo,
-                title,
-                body: `브랜치: ${context.ref}\n\n${content}\n\n_전체 리포트는 artifact(attachments)로 남겼습니다._`
-              });
-              console.log("Issue API result:", res.status || (res.data && res.data.number));
-            }
+          # ensure file exists
+          touch post_body_full.md
+          # create truncated version
+          # Convert to single-line-safe for character count; but preserve newlines
+          total_chars=$(wc -c < post_body_full.md || echo 0)
+          echo "post_body_full.md bytes: $total_chars"
+          MAX=${MAX_POST_CHARS:-1800}
+          # If small, copy; else take first N chars safely
+          if [ "$total_chars" -le "$MAX" ]; then
+            echo "File within MAX_POST_CHARS ($MAX). Copying entire file."
+            cp post_body_full.md post_body.md
+          else
+            echo "Truncating to $MAX chars for post_body.md"
+            # use head by bytes (may split utf8 but acceptable for comment)
+            head -c $MAX post_body_full.md > post_body.md
+            echo "" >> post_body.md
+            echo "" >> post_body.md
+            echo "(리포트가 길어 요약만 표시되었습니다. 전체 리포트는 artifact로 확인하세요.)" >> post_body.md
+          fi
 
-      - name: Upload artifacts
+          echo "=== post_body.md preview ==="
+          sed -n '1,60p' post_body.md || true
+          echo "=== end preview ==="
+          ls -la post_body.md || true
+
+      - name: Upload artifacts (report + semgrep results)
         uses: actions/upload-artifact@v4
         with:
           name: security-scan-artifacts
           path: |
             semgrep-results.json
+            semgrep-custom.json
             report.md
-            ai_summary.md
-            ai_summary_trunc.md
+            post_body_full.md
             post_body.md
+            ai_summary_structured.json
+          if-no-files-found: ignore
 
-      - name: Final debug - list outputs
+      - name: Post report (PR comment or create Issue) - unified
+        id: post_unified
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const path = 'post_body.md';
+            const body = fs.existsSync(path) ? fs.readFileSync(path,'utf8') : '자동 리포트가 생성되지 않았습니다.';
+            const isPR = !!context.payload.pull_request;
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+
+            try {
+              if (isPR) {
+                const prNumber = context.payload.pull_request.number;
+                console.log(`Posting comment to PR #${prNumber}`);
+                const res = await github.rest.issues.createComment({
+                  owner,
+                  repo,
+                  issue_number: prNumber,
+                  body: `### 🤖 AI Security Review (자동 요약)\n\n${body}\n\n_전체 리포트는 Artifact로 업로드되었습니다._`
+                });
+                console.log("Posted PR comment id:", res.data && res.data.id);
+              } else {
+                console.log("No PR detected - creating Issue with summary");
+                const title = `[AI Security Scan] 자동 리포트 - ${new Date().toISOString().slice(0,10)}`;
+                const res = await github.rest.issues.create({
+                  owner,
+                  repo,
+                  title,
+                  body: `브랜치: ${context.ref}\n\n${body}\n\n_전체 리포트는 Artifact로 업로드되었습니다._`
+                });
+                console.log("Created issue number:", res.data && res.data.number);
+              }
+            } catch (err) {
+              console.log("Error while posting:", err && (err.message || err));
+              // Write error to file for debugging
+              try {
+                fs.writeFileSync("post_error.log", String(err));
+              } catch (e) {}
+              throw err;
+            }
+
+      - name: Final debug - list generated files
         run: |
-          echo "---- workspace files ----"
-          ls -la
-          echo "---- sizes ----"
-          for f in semgrep-results.json report.md ai_summary.md ai_summary_trunc.md post_body.md; do
-            if [ -f "$f" ]; then wc -c "$f"; else echo "$f not found"; fi
-          done
-        shell: bash
+          echo "---- listing generated outputs for debug ----"
+          ls -la || true
+          echo "---- show post_body.md (head) ----"
+          head -n 200 post_body.md || true
+          echo "---- show report.md (head) ----"
+          head -n 200 report.md || true
