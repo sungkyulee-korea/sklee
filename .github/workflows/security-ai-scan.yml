@@ -1,4 +1,4 @@
-name: Security AI Scan (external script + semgrep)
+name: Security AI Scan (safe + detailed)
 
 on:
   push:
@@ -10,11 +10,13 @@ on:
 permissions:
   contents: read
   issues: write
+  pull-requests: write
 
 env:
-  MAX_FILE_BYTES: "200000"
-  MAX_FILES: "8"
-  OPENAI_MODEL: "gpt-4o-mini"
+  # 저장소에 등록한 시크릿 이름과 동일하게 설정하세요
+  OPENAI_API_KEY: ${{ secrets.SKLEE_OPENAI_API_KEY }}
+  MAX_FILE_BYTES: "150000"
+  MAX_FILES_TO_ANALYZE: "200"
 
 jobs:
   security-scan:
@@ -36,34 +38,90 @@ jobs:
           python -m pip install --upgrade pip
           pip install semgrep requests
 
-      - name: Run semgrep (builtin rules)
+      - name: Run semgrep (builtin rules + custom rules)
         run: |
-          semgrep --config p/ci --json --output semgrep-results.json || true
-          echo "semgrep finished, results saved to semgrep-results.json (if any)."
+          echo "Running semgrep with builtin p/ci and custom rules (if exist)"
+          # custom rules file path (repo에 추가한 경우)
+          CUSTOM_RULES=".semgrep/java-sqli.yml"
+          if [ -f "$CUSTOM_RULES" ]; then
+            semgrep --config p/ci,"$CUSTOM_RULES" --json --output semgrep-results.json || true
+          else
+            semgrep --config p/ci --json --output semgrep-results.json || true
+          fi
+          echo "semgrep exit: $?"
+          echo "semgrep results head (if exists):"
+          if [ -f semgrep-results.json ]; then head -n 200 semgrep-results.json || true; else echo "no semgrep-results.json"; fi
 
-      - name: Run external security script (python)
+      - name: Debug: list workspace top & git status
         run: |
+          echo "=== top-level files ==="
+          ls -la | sed -n '1,200p'
+          echo "=== .github/scripts listing ==="
+          ls -la .github/scripts || true
+          echo "=== git status ==="
+          git rev-parse --abbrev-ref HEAD || true
+          git status --porcelain || true
+
+      - name: Run external security script (generate report files)
+        run: |
+          echo "Run security script (will always produce report.md even if no findings)"
           python .github/scripts/security_scan.py
         env:
           OPENAI_API_KEY: ${{ secrets.SKLEE_OPENAI_API_KEY }}
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          MAX_FILE_BYTES: ${{ env.MAX_FILE_BYTES }}
-          MAX_FILES: ${{ env.MAX_FILES }}
-          OPENAI_MODEL: ${{ env.OPENAI_MODEL }}
+          GITHUB_REF: ${{ github.ref }}
+          GITHUB_SHA: ${{ github.sha }}
+          GITHUB_ACTOR: ${{ github.actor }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
 
-      - name: Debug: show generated reports (for troubleshooting)
+      - name: Debug: show generated reports
         run: |
-          echo "=== Artifacts present ==="
-          ls -la ai_report.md ai_summary.json semgrep-results.json || true
-          echo
-          echo "=== ai_report.md (head) ==="
-          if [ -f ai_report.md ]; then sed -n '1,200p' ai_report.md; else echo "(no ai_report.md)"; fi
-          echo
-          echo "=== ai_summary.json (head) ==="
-          if [ -f ai_summary.json ]; then sed -n '1,200p' ai_summary.json; else echo "(no ai_summary.json)"; fi
-          echo
-          echo "=== GitHub event file (head) ==="
-          if [ -n "${GITHUB_EVENT_PATH:-}" ] && [ -f "${GITHUB_EVENT_PATH}" ]; then sed -n '1,200p' "${GITHUB_EVENT_PATH}"; else echo "(no event file)"; fi
+          echo "---- report.md ----"
+          if [ -f report.md ]; then
+            echo "report.md size: $(stat -c%s report.md)"; sed -n '1,200p' report.md
+          else
+            echo "report.md missing"
+          fi
+          echo "---- ai_summary_structured.json ----"
+          if [ -f ai_summary_structured.json ]; then head -n 200 ai_summary_structured.json || true; else echo "ai_summary_structured.json missing"; fi
+          echo "---- semgrep-results.json ----"
+          if [ -f semgrep-results.json ]; then head -n 200 semgrep-results.json || true; else echo "semgrep-results.json missing"; fi
+
+      - name: Post result (PR comment or create Issue)  # 항상 시도
+        if: ${{ always() }}
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            let body = '';
+            if (fs.existsSync('report.md')) {
+              body = fs.readFileSync('report.md','utf8');
+            } else {
+              body = 'No report.md was generated.\n\n';
+              body += 'Workspace files (top):\n' + fs.readdirSync('.').slice(0,200).join('\n') + '\n\n';
+              if (fs.existsSync('semgrep-results.json')) {
+                body += 'semgrep-results.json present but report.md missing. semgrep head:\n';
+                body += fs.readFileSync('semgrep-results.json','utf8').slice(0,2000);
+              } else {
+                body += 'semgrep-results.json not present.\n';
+              }
+            }
+
+            const isPR = !!context.payload.pull_request;
+            if (isPR) {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.payload.pull_request.number,
+                body: `### 🤖 AI Security Review (자동 리포트)\n\n${body}\n\n_자동 생성 — 담당자 검토 필요_`
+              });
+            } else {
+              await github.rest.issues.create({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                title: `[AI Security Scan] 자동 리포트 - ${new Date().toISOString().slice(0,10)}`,
+                body: `브랜치: ${context.ref}\n\n${body}\n\n_자동 생성 리포트_`
+              });
+            }
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
@@ -71,5 +129,8 @@ jobs:
           name: security-scan-artifacts
           path: |
             semgrep-results.json
-            ai_report.md
-            ai_summary.json
+            ai_summary_structured.json
+            files_to_analyze.json
+            files_content.json
+            heuristics.json
+            report.md
