@@ -29,12 +29,11 @@ jobs:
           python -m pip install --upgrade pip
           pip install semgrep
 
-      - name: Run semgrep (builtin + repo custom)
+      - name: Run semgrep (builtin + all custom rules)
         run: |
-          # Run base rules + any rules in .semgrep folder
+          # Run base rules + ALL yaml files in .semgrep folder
           semgrep --config p/ci \
-                 --config ./.semgrep/java_sql_injection_concat.yml \
-                 --config ./.semgrep/java_sql_injection_statement.yml \
+                 --config ./.semgrep/ \
                  --json --output semgrep-results.json || true
           echo "semgrep done - output semgrep-results.json"
           ls -la semgrep-results.json || true
