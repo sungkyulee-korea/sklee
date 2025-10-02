@@ -1,18 +1,25 @@
-name: Security AI Scan (minimal, validated)
+name: Security AI Scan (KR report + post)
 
 on:
-  push:
-    branches: ['**']
+  workflow_dispatch:
   pull_request:
     types: [opened, synchronize, reopened]
-  workflow_dispatch:
+  push:
+    branches: ['**']
 
 permissions:
   contents: read
+  issues: write
+  pull-requests: write
+
+env:
+  # Optional: set OPENAI_API_KEY in Secrets if you later use OpenAI augmentation
+  OPENAI_API_KEY: ${{ secrets.SKLEE_OPENAI_API_KEY || '' }}
 
 jobs:
-  semgrep-scan:
+  security-scan:
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -33,9 +40,174 @@ jobs:
         run: |
           semgrep --config p/ci --json --output semgrep-results.json || true
           echo "semgrep finished; semgrep-results.json written (if any findings)."
+          ls -la semgrep-results.json || true
 
-      - name: Upload semgrep results artifact
+      - name: Generate report (create report.md from semgrep-results.json)
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const fs = require('fs');
+
+            function normSeverity(s) {
+              if (!s) return 'LOW';
+              s = String(s).toLowerCase();
+              if (s.includes('critical') || s.includes('error') || s.includes('high')) return 'CRITICAL';
+              if (s.includes('medium') || s.includes('moderate')) return 'MEDIUM';
+              return 'LOW';
+            }
+
+            function detectCWE(msg) {
+              if (!msg) return '';
+              const m = /cwe[-_ ]?(\d{1,4})/i.exec(msg);
+              if (m) return 'CWE-' + m[1];
+              const lower = msg.toLowerCase();
+              if (lower.includes('sql')) return 'CWE-89';
+              if (lower.includes('xss') || lower.includes('<script')) return 'CWE-79';
+              if (lower.includes('ldap')) return 'CWE-90';
+              if (lower.includes('xpath')) return 'CWE-643';
+              return '';
+            }
+
+            function recommend(msg) {
+              if (!msg) return '입력 검증(화이트리스트) 및 출력 인코딩 적용을 권고합니다.';
+              const m = msg.toLowerCase();
+              if (m.includes('sql') || m.includes('execute') && m.includes('statement')) {
+                return 'SQL 인젝션: PreparedStatement(파라미터 바인딩) 사용 및 입력 검증(화이트리스트) 적용.';
+              }
+              if (m.includes('xss') || m.includes('<script')) {
+                return 'XSS: 출력 시 HTML 인코딩(예: HtmlUtils.htmlEscape) 또는 템플릿 자동 이스케이프 사용.';
+              }
+              if (m.includes('ldap') || m.includes('ldapinject')) {
+                return 'LDAP 인젝션: 파라미터화된 쿼리 또는 입력 이스케이프 사용.';
+              }
+              if (m.includes('xpath')) {
+                return 'XPath 인젝션: 사용자 입력 이스케이프 또는 파라미터화 사용.';
+              }
+              if (m.includes('exec') || m.includes('runtime.exec') || m.includes('process')) {
+                return 'OS 명령 실행: 외부 입력을 명령에 직접 사용하지 말고 안전한 API 사용/화이트리스트 적용.';
+              }
+              return '입력 검증, 최소 권한, 출력 인코딩 적용을 권고합니다.';
+            }
+
+            // read semgrep results
+            let semgrep = {};
+            if (fs.existsSync('semgrep-results.json')) {
+              try {
+                semgrep = JSON.parse(fs.readFileSync('semgrep-results.json','utf8') || '{}');
+              } catch(e) {
+                core.info('Failed to parse semgrep-results.json: ' + String(e));
+                semgrep = {};
+              }
+            }
+            const results = Array.isArray(semgrep.results) ? semgrep.results : [];
+
+            const findings = results.map(r => {
+              const path = r.path || ((r.extra && r.extra.metadata && r.extra.metadata.file) || '-');
+              const msg = (r.extra && r.extra.message) || r.message || '';
+              let line = '-';
+              if (r.start && typeof r.start === 'object') line = r.start.line || '-';
+              else if (r.start) line = r.start;
+              const sev = normSeverity((r.extra && r.extra.severity) || r.severity);
+              const cwe = detectCWE(msg);
+              const rec = recommend(msg);
+              return {file: path, line, severity: sev, cwe, msg, rec};
+            });
+
+            // make summary decision
+            let overall = '취약점 없음 (자동 분석)';
+            if (findings.some(f => f.severity === 'CRITICAL')) overall = '취약점 있음 (Block)';
+            else if (findings.some(f => f.severity === 'MEDIUM')) overall = '수동 검토 필요';
+
+            // build markdown
+            const lines = [];
+            lines.push(`# 🤖 AI Security Review (자동 리포트) - ${new Date().toISOString().slice(0,10)}`);
+            lines.push('');
+            lines.push(`**전체 판단:** ${overall}`);
+            lines.push('');
+            lines.push('**요약:**');
+            if (findings.length > 0) {
+              const crit = findings.filter(f => f.severity==='CRITICAL').length;
+              const med = findings.filter(f => f.severity==='MEDIUM').length;
+              const low = findings.filter(f => f.severity==='LOW').length;
+              lines.push(`- 총 발견 항목: ${findings.length} (Critical: ${crit}, Medium: ${med}, Low: ${low})`);
+            } else {
+              lines.push('- 탐지된 취약점 없음 (자동 기준)');
+            }
+            lines.push('');
+            lines.push('## 상세 항목');
+            lines.push('');
+            if (findings.length > 0) {
+              lines.push('|파일|라인|심각도|CWE|문제 요약|권고(한글)|');
+              lines.push('|---|---:|---|---|---|---|');
+              for (const f of findings) {
+                const file = String(f.file).replace(/\|/g,'\\|');
+                const msg = String(f.msg).replace(/\n/g,' ').replace(/\|/g,'\\|');
+                const rec = String(f.rec).replace(/\n/g,' ').replace(/\|/g,'\\|');
+                lines.push(`|${file}|${f.line}|${f.severity}|${f.cwe || '-'}|${msg}|${rec}|`);
+              }
+            } else {
+              lines.push('취약점 항목이 없습니다.');
+            }
+            lines.push('');
+            lines.push('## 권고 요약');
+            if (findings.length > 0) {
+              lines.push('- 각 항목별 권고를 표의 `권고(한글)` 열에서 확인하세요.');
+              lines.push('- 일반 권고: PreparedStatement(파라미터 바인딩), 입력 검증(화이트리스트), 출력 인코딩, 최소 권한 적용.');
+            } else {
+              lines.push('- 자동분석으로는 취약점 없음. 단, 중요 로직은 수동 검토 권장.');
+            }
+            lines.push('');
+            lines.push('---');
+            lines.push('_자동 생성 리포트 — 담당자 검토 필요_');
+
+            // write report.md
+            fs.writeFileSync('report.md', lines.join('\\n'), {encoding:'utf8'});
+            core.info('report.md created (length:' + fs.readFileSync('report.md','utf8').length + ')');
+
+      - name: Show report head (for logs)
+        run: |
+          if [ -f report.md ]; then
+            echo "===== report.md (head) ====="
+            sed -n '1,160p' report.md || true
+            echo "===== end head ====="
+          else
+            echo "report.md not found"
+          fi
+
+      - name: Post report (PR comment or create Issue)
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const fs = require('fs');
+            const path = 'report.md';
+            const bodyFull = fs.existsSync(path) ? fs.readFileSync(path,'utf8') : 'No report generated.';
+            const bodyToPost = (bodyFull.length > 8000) ? bodyFull.slice(0,8000) + '\n\n(리포트 요약만 게시됨; 전체는 artifact 참조)' : bodyFull;
+            const isPR = !!context.payload.pull_request;
+            if (isPR) {
+              const issue_number = context.payload.pull_request.number;
+              const resp = await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number,
+                body: `### 🤖 AI Security Review (자동 요약)\n\n${bodyToPost}\n\n_자동 생성 — 담당자 검토 필요_`
+              });
+              core.info('Posted PR comment. API status: ' + (resp.status || 'unknown'));
+            } else {
+              const resp = await github.rest.issues.create({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                title: `[AI Security Scan] 자동 리포트 - ${new Date().toISOString().slice(0,10)}`,
+                body: `브랜치: ${context.ref}\n\n${bodyToPost}\n\n_자동 생성 리포트_`
+              });
+              core.info('Created issue. API status: ' + (resp.status || 'unknown'));
+            }
+
+      - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: semgrep-results
-          path: semgrep-results.json
+          name: security-scan-artifacts
+          path: |
+            semgrep-results.json
+            report.md
