@@ -1,24 +1,23 @@
 # .github/scripts/security_scan.py
-# Python 3.8+ - semgrep output 기반 간단 리포트 생성
-import json, os, sys, textwrap
+import json, os, sys
 
 MAX_POST_BYTES = int(os.environ.get("MAX_POST_CHARS", "1800"))
 
-def load_results(filename):
-    if not os.path.exists(filename):
+def load(fname):
+    if not os.path.exists(fname):
         return []
     try:
-        with open(filename, "r", encoding="utf8") as f:
+        with open(fname, "r", encoding="utf8") as f:
             j = json.load(f)
         if isinstance(j, dict) and "results" in j:
             return j.get("results", [])
-        return []
     except Exception:
-        return []
+        pass
+    return []
 
 results = []
-results += load_results("semgrep-results.json")
-results += load_results("semgrep-custom.json")
+results += load("semgrep-results.json")
+results += load("semgrep-custom.json")
 
 lines = []
 lines.append("# 자동 보안 리포트 (Semgrep 기반)")
@@ -46,14 +45,10 @@ lines.append("_전체 리포트는 artifact로 보관됩니다._")
 with open("report.md", "w", encoding="utf8") as fw:
     fw.write("\n".join(lines))
 
-# prepare short posting file
-short_head = "\n".join(lines[:60])  # first ~60 lines
-b = short_head.encode("utf8")[:MAX_POST_BYTES]
-try:
-    with open("post_body_short.md", "wb") as fo:
-        fo.write(b)
-    print("post_body_short.md written")
-except Exception as e:
-    print("failed writing post_body_short.md:", e)
+# short file for posting to issue/comment
+short_text = "\n".join(lines[:60])
+b = short_text.encode("utf8")[:MAX_POST_BYTES]
+with open("post_body_short.md", "wb") as fo:
+    fo.write(b)
 
-print("report.md created, entries:", len(results))
+print("report.md and post_body_short.md created (entries: %d)" % len(results))
