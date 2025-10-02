@@ -1,4 +1,4 @@
-name: Security AI Scan (summary -> Issue/PR, full report artifact)
+name: Security AI Scan (safe + detailed, debug + forced-post)
 
 on:
   push:
@@ -16,6 +16,7 @@ env:
   OPENAI_API_KEY: ${{ secrets.SKLEE_OPENAI_API_KEY }}
   MAX_FILE_BYTES: "150000"
   MAX_FILES_TO_ANALYZE: "200"
+  TRUNCATE_BODY_CHARS: "1800"
 
 jobs:
   security-scan:
@@ -37,145 +38,187 @@ jobs:
           python -m pip install --upgrade pip
           pip install semgrep requests
 
-      - name: Run semgrep (builtin rules or local semgrep.yml)
+      - name: Run semgrep (builtin rules)
         run: |
-          if [ -f .semgrep.yml ]; then
-            semgrep --config .semgrep.yml --json --output semgrep-results.json || true
-          elif [ -f semgrep.yml ]; then
-            semgrep --config semgrep.yml --json --output semgrep-results.json || true
-          else
-            semgrep --config p/ci --json --output semgrep-results.json || true
-          fi
-          echo "semgrep finished; semgrep-results.json created if findings exist."
+          semgrep --config p/ci --json --output semgrep-results.json || true
+          echo "semgrep finished"
 
-      - name: Run external security script (if present) -> produce report.md
-        id: run_external
+      - name: Run external security script (if present) or fallback (create report.md)
+        id: run_script
         run: |
-          set -euo pipefail
-          echo "Listing .github/scripts:"
+          echo "---- external script step ----"
           ls -la .github/scripts || true
 
           if [ -f .github/scripts/security_scan.py ]; then
-            echo "Found .github/scripts/security_scan.py -> running it (exit code ignored)"
-            python .github/scripts/security_scan.py || true
+            echo "Found .github/scripts/security_scan.py -> executing"
+            python .github/scripts/security_scan.py
+            echo "external script finished"
           else
-            echo "No external script found -> generate fallback report.md from semgrep-results.json"
+            echo "No external script found -> generating fallback report from semgrep-results.json"
             python - <<'PY'
-import json, os, sys
-out = 'report.md'
+import json, os
+out = "report.md"
 lines = []
 try:
-    results = []
-    if os.path.exists('semgrep-results.json'):
-        with open('semgrep-results.json','r',encoding='utf8') as f:
+    if os.path.exists("semgrep-results.json"):
+        with open("semgrep-results.json","r",encoding="utf8") as f:
             data = json.load(f)
-        results = data.get('results', []) if isinstance(data, dict) else []
-
-    lines.append("### AI Security Review (자동 리포트)")
+        results = data.get("results", []) if isinstance(data, dict) else []
+    else:
+        results = []
+    lines.append("# AI Security Review (자동 리포트)")
     lines.append("")
     if results:
-        lines.append("## Semgrep 발견 항목:")
+        lines.append("## Semgrep 발견 항목")
         for r in results[:200]:
-            path = r.get('path') or r.get('extra', {}).get('metadata', {}).get('file', '-')
-            extra = r.get('extra', {})
-            msg = extra.get('message') or r.get('message') or ''
-            start = '-'
-            if isinstance(r.get('start'), dict):
-                start = r.get('start').get('line', '-')
+            path = r.get("path") or r.get("extra",{}).get("metadata",{}).get("file","-")
+            extra = r.get("extra",{})
+            msg = extra.get("message") or r.get("message") or ""
+            start = "-"
+            if isinstance(r.get("start"), dict):
+                start = r.get("start").get("line","-")
             else:
-                start = r.get('start', '-')
-            sev = extra.get('severity', '')
+                start = r.get("start","-")
+            sev = extra.get("severity","")
             lines.append(f"- {path}:{start} [{sev}] {msg}")
     else:
-        lines.append("- Semgrep: 문제 없음 (기본 룰).")
-
+        lines.append("- Semgrep: 탐지된 항목 없음 (기본 룰 기준).")
     lines.append("")
-    lines.append("_자동 리포트 — 담당자 검토 필요_")
-    with open(out, 'w', encoding='utf8') as fw:
-        fw.write('\n'.join(lines))
-    print('report.md created; files_count: 1')
+    lines.append("_자동 생성 리포트 — 담당자 검토 필요_")
+    with open(out,"w",encoding="utf8") as fw:
+        fw.write("\n".join(lines))
+    print("Fallback report.md created")
 except Exception as e:
-    print('Failed to create fallback report:', e)
-    sys.exit(0)
+    print("Fallback report generation failed:", e)
+    raise
 PY
           fi
+          echo "---- end external script step ----"
 
-      - name: Create short summary (truncate for Issue/PR body)
+      - name: Create ai_summary_structured.json if missing (short structured summary)
         run: |
-          set -euo pipefail
-          # if report.md exists, take first N lines then truncate characters to limit
-          if [ -f report.md ]; then
-            head -n 200 report.md > summary_raw.md || true
-            python - <<'PY'
-txt = open('summary_raw.md','r',encoding='utf8').read()
-max_chars = 4000
-if len(txt) > max_chars:
-    txt = txt[:max_chars] + "\n\n... (요약이 길어 전체 리포트는 artifact에 첨부됨)\n"
-open('summary.md','w',encoding='utf8').write(txt)
-print("summary.md created, length:", len(txt))
-PY
-          else
-            echo "### AI Security Review (요약)" > summary.md
-            echo "" >> summary.md
-            echo "- 리포트 없음. semgrep-results.json 또는 외부 스크립트 결과 확인." >> summary.md
+          if [ ! -f ai_summary_structured.json ]; then
+            echo '{"summary":"(자동요약 없음)","items":[]} ' > ai_summary_structured.json
+            echo "ai_summary_structured.json created (placeholder)"
           fi
-          echo "summary.md contents (head):"
-          sed -n '1,120p' summary.md || true
 
-      - name: Post summary (as PR comment or create Issue)  # always run to ensure posting attempt
+      - name: Prepare short summary for posting (truncate)
+        id: prepare_summary
+        run: |
+          REPORT="report.md"
+          if [ -f "$REPORT" ]; then
+            # convert to plain text and truncate to TRUNCATE_BODY_CHARS
+            CHARS=${TRUNCATE_BODY_CHARS:-1800}
+            # take first N chars, prefer to keep lines intact
+            head -c $CHARS "$REPORT" > report.trunc.md || true
+            # add note if truncated
+            ORIG_SIZE=$(wc -c < "$REPORT" || echo 0)
+            TRUNC_SIZE=$(wc -c < report.trunc.md || echo 0)
+            if [ "$ORIG_SIZE" -gt "$TRUNC_SIZE" ]; then
+              echo "" >> report.trunc.md
+              echo "---" >> report.trunc.md
+              echo "[전체 리포트는 artifact로 업로드되어 있습니다. 실행 URL 참조]" >> report.trunc.md
+            fi
+            echo "report.trunc.md prepared; orig_size=$ORIG_SIZE trunc_size=$TRUNC_SIZE"
+            wc -c report.md || true
+            wc -c report.trunc.md || true
+          else
+            echo "No report.md found; creating minimal placeholder"
+            echo "# AI Security Scan - 빈 리포트" > report.trunc.md
+            echo "No findings (or report generation failed)." >> report.trunc.md
+          fi
+
+      - name: Debug / Force try create minimal Issue (diagnose why not posted)
         if: ${{ always() }}
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
-          EVENT_PATH: ${{ github.event_path }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           python - <<'PY'
-import os, json, requests
+import os, json, requests, sys
 repo = os.environ['REPO']
-token = os.environ.get('GITHUB_TOKEN')
-event_path = os.environ.get('EVENT_PATH')
+token = os.environ.get('GH_TOKEN')
 headers = {'Authorization': f'token {token}', 'Accept': 'application/vnd.github+json'}
-body_text = ''
-if os.path.exists('summary.md'):
-    body_text = open('summary.md','r',encoding='utf8').read()
-else:
-    body_text = "(No summary available)"
+print("Repo:", repo)
+files = ['report.md','report.trunc.md','semgrep-results.json','ai_summary_structured.json']
+for f in files:
+    if os.path.exists(f):
+        print(f"{f}: exists, size={os.path.getsize(f)} bytes")
+        with open(f,'r',encoding='utf8',errors='ignore') as fh:
+            head = ''.join([next(fh) for _ in range(10)]) if os.path.getsize(f)>0 else ''
+            print("---- head:",f,"----")
+            print(head)
+            print("---- end head ----")
+    else:
+        print(f"{f}: NOT FOUND")
 
-# attach small note
-body_text = "### AI Security Review (요약)\n\n" + body_text + "\n\n(전체 리포트는 artifact로 업로드됩니다)"
-
-# detect PR
-is_pr = False
-pr_number = None
-if event_path and os.path.exists(event_path):
-    ev = json.load(open(event_path,'r',encoding='utf8'))
-    if 'pull_request' in ev and ev['pull_request'] and 'number' in ev['pull_request']:
-        is_pr = True
-        pr_number = ev['pull_request']['number']
-
-if is_pr:
-    url = f'https://api.github.com/repos/{repo}/issues/{pr_number}/comments'
-    payload = {'body': body_text}
-    r = requests.post(url, headers=headers, json=payload)
-    print('POST PR comment to', url, 'status', r.status_code)
-    print(r.text[:2000])
-else:
-    url = f'https://api.github.com/repos/{repo}/issues'
-    title = f"[AI Security Scan] 자동 리포트 - {__import__('datetime').datetime.utcnow().date()}"
-    payload = {'title': title, 'body': body_text}
-    r = requests.post(url, headers=headers, json=payload)
-    print('Created issue via', url, 'status', r.status_code)
-    print(r.text[:2000])
+# Try to create a minimal issue to validate permissions
+url = f"https://api.github.com/repos/{repo}/issues"
+payload = {"title":"[DEBUG] minimal issue from Actions","body":"This is a minimal test issue created by Actions (debug). If you see this, token + permissions are OK. Run URL: " + os.environ.get('RUN_URL','')}
+print("Trying to create minimal issue (no big body)...")
+r = requests.post(url, headers=headers, json=payload)
+print("Status:", r.status_code)
+try:
+    print("Response:", json.dumps(r.json(), indent=2)[:2000])
+except Exception as e:
+    print("Response text:", r.text[:2000])
 PY
 
-      - name: Upload artifacts (full report + extras)
+      - name: Post report (PR comment or create Issue) - truncated body only
+        id: post_report
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -e
+          BODY_FILE="report.trunc.md"
+          if [ ! -f "$BODY_FILE" ]; then
+            echo "No truncated report to post - exiting step"
+            exit 0
+          fi
+          BODY=$(python - <<'PY'
+import sys, json
+fn="report.trunc.md"
+txt=open(fn,"r",encoding="utf8",errors="ignore").read()
+# Escape and wrap
+payload = {"title":"[AI Security Scan] 자동 리포트 - ${date}".replace("${date}", __import__("datetime").datetime.utcnow().strftime("%Y-%m-%d")),
+           "body": txt}
+print(json.dumps(payload))
+PY
+)
+          echo "Prepared payload (truncated, not printing full body for log safety)"
+          echo "$BODY" > payload.json
+          # detect PR
+          if [ -n "${{ github.event.pull_request.number || '' }}" ]; then
+            PR_NUM=${{ github.event.pull_request.number }}
+            echo "Posting comment to PR #${PR_NUM}"
+            # create comment
+            API="https://api.github.com/repos/${REPO}/issues/${PR_NUM}/comments"
+            RESP=$(curl -s -o /tmp/resp.json -w "%{http_code}" -X POST -H "Authorization: token ${GH_TOKEN}" -H "Accept: application/vnd.github+json" -d @payload.json "$API")
+            echo "HTTP status: $RESP"
+            cat /tmp/resp.json || true
+          else
+            echo "No PR detected -> creating a new Issue"
+            API="https://api.github.com/repos/${REPO}/issues"
+            RESP=$(curl -s -o /tmp/resp.json -w "%{http_code}" -X POST -H "Authorization: token ${GH_TOKEN}" -H "Accept: application/vnd.github+json" -d @payload.json "$API")
+            echo "HTTP status: $RESP"
+            cat /tmp/resp.json || true
+          fi
+          # if 201 success, done; if not, we will still upload artifacts and debug logs
+
+      - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
           name: security-scan-artifacts
           path: |
             semgrep-results.json
             report.md
-            summary.md
+            report.trunc.md
+            ai_summary_structured.json
 
-      - name: Done
-        run: echo "Security scan job finished."
+      - name: Post cleanup/info
+        if: ${{ always() }}
+        run: |
+          echo "Workflow finished. If 'HTTP status' above is not 201, check organization policies and token permissions."
