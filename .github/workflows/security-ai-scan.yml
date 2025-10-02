@@ -13,6 +13,7 @@ permissions:
   pull-requests: write
 
 env:
+  # 저장소 Secrets에 SKLEE_OPENAI_API_KEY로 OpenAI 키를 넣어두면 사용(선택)
   OPENAI_API_KEY: ${{ secrets.SKLEE_OPENAI_API_KEY }}
   MAX_POST_CHARS: "1800"
   MAX_FILES_TO_ANALYZE: "200"
@@ -28,7 +29,7 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Setup Python
+      - name: Setup Python 3.10
         uses: actions/setup-python@v4
         with:
           python-version: '3.10'
@@ -38,151 +39,102 @@ jobs:
           python -m pip install --upgrade pip
           pip install semgrep requests || true
 
-      - name: Run semgrep builtin rules
+      - name: Run semgrep builtin
+        id: run_semgrep_builtin
         run: |
+          echo "Running semgrep builtin rules..."
           semgrep --config p/ci --json --output semgrep-results.json || true
           ls -la semgrep-results.json || true
 
-      - name: Run semgrep custom config if present
+      - name: Run semgrep custom if exists
+        id: run_semgrep_custom
         run: |
           if [ -f .semgrep.yml ] || [ -f .semgrep.yaml ]; then
+            echo "Found custom semgrep config - running"
             semgrep --config .semgrep.yml --json --output semgrep-custom.json || true
             ls -la semgrep-custom.json || true
           else
-            echo "no custom semgrep config"
+            echo "No custom semgrep config found - skipping"
           fi
 
-      - name: Run external security script if present (creates report.md)
+      - name: List .github/scripts
+        run: |
+          echo "Listing .github/scripts (if present)"
+          ls -la .github/scripts || true
+
+      - name: Run external security script if present
         id: run_external
         run: |
-          ls -la .github/scripts || true
           if [ -f .github/scripts/security_scan.py ]; then
             echo "Running .github/scripts/security_scan.py"
             python .github/scripts/security_scan.py || echo "external script failed but continuing"
           else
-            echo "No external script found - fallback will create report.md via minimal method"
-            # fallback: minimal report from semgrep outputs
-            python - <<'PY'
-import json, os
-results = []
-for f in ("semgrep-custom.json","semgrep-results.json"):
-    if os.path.exists(f):
-        try:
-            with open(f, "r", encoding="utf8") as fh:
-                j = json.load(fh)
-            if isinstance(j, dict) and "results" in j:
-                results += j.get("results", [])
-        except Exception:
-            pass
-lines = ["# 자동 보안 리포트 (Semgrep fallback)", ""]
-if results:
-    lines.append("## 발견 항목 (요약)")
-    for r in results[:200]:
-        path = r.get('path') or r.get('extra',{}).get('metadata',{}).get('file','-')
-        extra = r.get('extra') or {}
-        msg = extra.get('message') or r.get('message') or ''
-        start = '-'
-        if isinstance(r.get('start'), dict):
-            start = r.get('start').get('line','-')
-        else:
-            start = r.get('start','-')
-        sev = extra.get('severity','UNKNOWN')
-        lines.append(f"- {path}:{start} [{sev}] {msg}")
-else:
-    lines.append("- Semgrep: 탐지 없음 (기본/커스텀 룰 기준).")
-lines.append("")
-lines.append("_전체 리포트는 artifact로 보관됩니다._")
-open("report.md","w",encoding="utf8").write("\n".join(lines))
-print("report.md created")
-PY
+            echo "No external script found - creating a minimal fallback report.md"
+            echo "# 간단 fallback 리포트" > report.md || true
+            echo "" >> report.md
+            echo "- No external script and no semgrep results processed." >> report.md || true
+            echo "_전체 리포트는 artifact로 보관됩니다._" >> report.md || true
+            # also create a short post body
+            head -n 50 report.md > post_body_short.md || true
           fi
 
       - name: Debug: show generated files and sizes
         run: |
-          echo "report.md listing:"
+          echo "=== report.md preview ==="
           ls -la report.md || true
-          echo "report.md size (bytes):"
+          echo "size (bytes):"
           wc -c report.md || true
-          echo "short preview:"
-          head -n 120 report.md || true
-          echo "semgrep files:"
+          echo "=== post_body_short.md preview ==="
+          ls -la post_body_short.md || true
+          echo "content (first 200 chars):"
+          if [ -f post_body_short.md ]; then head -c 200 post_body_short.md || true; echo; fi
+          echo "=== semgrep outputs ==="
           ls -la semgrep-results.json semgrep-custom.json || true
 
-      - name: Prepare short summary to post
-        run: |
-          SHORT=post_body_short.md
-          if [ -f report.md ]; then
-            head -n 400 report.md > /tmp/_tmp_head.md || true
-            dd if=/tmp/_tmp_head.md of=$SHORT bs=1 count=${{ env.MAX_POST_CHARS }} status=none || true
-            echo "Prepared $SHORT ($(wc -c < $SHORT || true) bytes)"
-          else
-            echo "자동 리포트가 생성되지 않았습니다. 아티팩트를 확인하세요." > $SHORT
-            echo "Prepared fallback $SHORT"
-          fi
-
-      - name: Debug: short preview
-        run: |
-          SHORT=post_body_short.md
-          echo "=== short first 400 chars ==="
-          head -c 400 $SHORT || true
-          echo
-          echo "=== short lines ==="
-          sed -n '1,80p' $SHORT || true
-
-      - name: Post report (PR comment or create Issue)
+      - name: Post result (PR comment or Issue)
         uses: actions/github-script@v7
         with:
           script: |
             const fs = require('fs');
             const shortPath = 'post_body_short.md';
-            let body = '';
-            if (fs.existsSync(shortPath)) body = fs.readFileSync(shortPath,'utf8');
-            else if (fs.existsSync('report.md')) body = fs.readFileSync('report.md','utf8').slice(0,1600);
-            else body = '자동 리포트가 생성되지 않았습니다. 아티팩트를 확인하세요.';
+            let body = null;
 
-            const header = `### 🤖 AI Security Review (자동 리포트)\n\n`;
-            const summary = header + body + `\n\n_자동 생성 리포트 — 담당자 검토 필요_`;
-
-            console.log("Event name:", context.event_name);
-
-            try {
-              if (context.event_name === 'pull_request' && context.payload.pull_request) {
-                const prNum = context.payload.pull_request.number;
-                const res = await github.rest.issues.createComment({
-                  owner: context.repo.owner,
-                  repo: context.repo.repo,
-                  issue_number: prNum,
-                  body: summary
-                });
-                console.log("PR comment URL:", res.data && res.data.html_url);
-                return { posted: 'pr_comment' };
-              } else {
-                const title = `[AI Security Scan] 자동 리포트 - ${new Date().toISOString().slice(0,10)}`;
-                const res = await github.rest.issues.create({
-                  owner: context.repo.owner,
-                  repo: context.repo.repo,
-                  title: title,
-                  body: summary
-                });
-                console.log("Issue URL:", res.data && res.data.html_url);
-                return { posted: 'issue' };
-              }
-            } catch (err) {
-              console.log("Failed to post report:", err && err.message ? err.message : err);
-              // try to create a tiny fallback issue
+            if (fs.existsSync(shortPath)) {
               try {
-                const res2 = await github.rest.issues.create({
-                  owner: context.repo.owner,
-                  repo: context.repo.repo,
-                  title: `[AI Security Scan] 게시 실패 - ${new Date().toISOString().slice(0,10)}`,
-                  body: "자동 리포트 게시가 실패했습니다. 아티팩트를 확인하세요."
-                });
-                console.log("Fallback issue created:", res2.data && res2.data.html_url);
-                return { posted: 'fallback_issue' };
-              } catch (err2) {
-                console.log("Fallback also failed:", err2 && err2.message ? err2.message : err2);
-                return { posted: 'failed' };
+                body = fs.readFileSync(shortPath, 'utf8');
+              } catch (e) {
+                body = null;
               }
+            }
+
+            // fallback to full report if short not present
+            if (!body && fs.existsSync('report.md')) {
+              body = fs.readFileSync('report.md', 'utf8').slice(0, 1800);
+            }
+
+            if (!body) {
+              body = "자동 리포트가 생성되지 않았습니다. 아티팩트에서 report.md를 확인하세요.";
+            }
+
+            const isPR = !!context.payload.pull_request;
+            if (isPR) {
+              // Post as PR comment
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.payload.pull_request.number,
+                body: `### 🤖 AI Security Review (자동 리포트)\n\n${body}\n\n_전체 리포트는 artifact로 보관됩니다._`
+              });
+              console.log("Posted PR comment");
+            } else {
+              // Create an issue on push
+              await github.rest.issues.create({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                title: `[AI Security Scan] 자동 리포트 - ${new Date().toISOString().slice(0,10)}`,
+                body: `브랜치: ${context.ref}\n\n${body}\n\n_전체 리포트는 artifact로 보관됩니다._`
+              });
+              console.log("Created issue with report");
             }
 
       - name: Upload artifacts
