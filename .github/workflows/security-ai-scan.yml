@@ -1,5 +1,6 @@
-name: Security AI Scan (unified post)
+name: Security AI Scan (semgrep + AI summary)
 
+# 트리거: push 및 PR (opened, synchronize, reopened) 모두 처리
 on:
   push:
     branches: ['**']
@@ -13,22 +14,25 @@ permissions:
   pull-requests: write
 
 env:
+  # 저장소 Secrets에 실제 키를 등록하세요 (이름은 예시)
   OPENAI_API_KEY: ${{ secrets.SKLEE_OPENAI_API_KEY }}
+  # 이슈/코멘트로 보낼 최대 바이트 수 (UTF-8 문자수와 다를 수 있음)
   MAX_POST_CHARS: 1800
+  # 분석할 파일/크기 등 파라미터
   MAX_FILES_TO_ANALYZE: "200"
   MAX_FILE_BYTES: "150000"
 
 jobs:
   security-scan:
     runs-on: ubuntu-latest
-
     steps:
+
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - name: Setup Python 3.10
+      - name: Setup Python 3.x
         uses: actions/setup-python@v4
         with:
           python-version: '3.10'
@@ -43,7 +47,7 @@ jobs:
         run: |
           echo "Running semgrep builtin rules..."
           semgrep --config p/ci --json --output semgrep-results.json || true
-          echo "semgrep builtin complete"
+          echo "semgrep builtin finished"
           ls -la semgrep-results.json || true
 
       - name: Run semgrep (custom .semgrep.yml if present)
@@ -57,173 +61,151 @@ jobs:
             echo "No custom semgrep config found - skipping"
           fi
 
-      - name: Run external security script (if present)
-        id: run_script
+      - name: Run external security script (if present) or generate fallback report
+        id: run_external
         run: |
           echo "----- START external security script step -----"
           echo "Listing .github/scripts (if present):"
           ls -la .github/scripts || true
 
-          # If user script present, run it (script should write report.md or other outputs)
           if [ -f .github/scripts/security_scan.py ]; then
-            echo "Running .github/scripts/security_scan.py"
-            python .github/scripts/security_scan.py || echo "external script failed (non-zero exit) - continuing"
-            echo "external script done"
+            echo "Found .github/scripts/security_scan.py - running it (non-fatal)"
+            python .github/scripts/security_scan.py || echo "external script returned non-zero, continuing"
+            echo "external script step done"
           else
-            echo "No external script - creating fallback report.md from semgrep results"
+            echo "No external script found - generating fallback report.md from semgrep outputs"
+
             python - <<'PY'
 import json, os, sys
 out = "report.md"
 lines = []
+results = []
+
+# combine builtin + custom semgrep results if present
+for fname in ("semgrep-custom.json", "semgrep-results.json"):
+    if os.path.exists(fname):
+        try:
+            with open(fname, "r", encoding="utf8") as f:
+                j = json.load(f)
+            if isinstance(j, dict) and "results" in j:
+                results += j.get("results", [])
+        except Exception:
+            pass
+
+lines.append("# 자동 보안 리포트 (Semgrep 기반 초안)")
+lines.append("")
+if results:
+    lines.append("## 발견 항목 요약")
+    for r in results[:300]:
+        # compatibility for different semgrep output shapes
+        path = r.get('path') or r.get('extra', {}).get('metadata', {}).get('file', '-') 
+        extra = r.get('extra', {}) or {}
+        msg = extra.get('message') or r.get('message') or ''
+        start = '-'
+        if isinstance(r.get('start'), dict):
+            start = r.get('start').get('line', '-')
+        else:
+            start = r.get('start', '-')
+        sev = extra.get('severity', 'UNKNOWN')
+        lines.append(f"- {path}:{start} [{sev}] {msg}")
+else:
+    lines.append("- Semgrep: 문제 없음 (기본/커스텀 룰 기준).")
+
+lines.append("")
+lines.append("_전체 리포트는 artifact로 보관됩니다. (자동 생성 — 담당자 검토 필요)_")
+
 try:
-    sr = "semgrep-results.json"
-    results = []
-    if os.path.exists("semgrep-custom.json"):
-        with open("semgrep-custom.json","r",encoding="utf8") as f:
-            j = json.load(f)
-            if isinstance(j, dict) and "results" in j:
-                results += j.get("results",[])
-    if os.path.exists(sr):
-        with open(sr,"r",encoding="utf8") as f:
-            j = json.load(f)
-            if isinstance(j, dict) and "results" in j:
-                results += j.get("results",[])
-    lines.append("# 자동 보안 리포트 (Semgrep 기반 초안)")
-    lines.append("")
-    if results:
-        lines.append("## 발견 항목 요약")
-        for r in results[:200]:
-            path = r.get('path') or r.get('extra',{}).get('metadata',{}).get('file','-')
-            extra = r.get('extra',{})
-            msg = extra.get('message') or r.get('message','')
-            start = '-'
-            if isinstance(r.get('start'), dict):
-                start = r.get('start').get('line','-')
-            else:
-                start = r.get('start','-')
-            sev = extra.get('severity','UNKNOWN')
-            lines.append(f"- {path}:{start} [{sev}] {msg}")
-    else:
-        lines.append("- Semgrep: 문제 없음 (기본/커스텀 룰 기준).")
-    lines.append("")
-    lines.append("전체 리포트는 artifact로 보관됩니다. (자동 생성 — 담당자 검토 필요)")
-    with open(out,"w",encoding="utf8") as fw:
+    with open(out, "w", encoding="utf8") as fw:
         fw.write("\n".join(lines))
     print("Fallback report.md created")
 except Exception as e:
-    print("Failed to create fallback report:", e)
+    print("Failed creating fallback report:", e)
     sys.exit(0)
 PY
           fi
           echo "----- END external security script step -----"
 
-      - name: Prepare post body and truncation (post_body.md)
-        id: prepare_post
+      - name: Debug: show generated files and sizes
+        run: |
+          echo "=== Report files listing ==="
+          ls -la report.md || true
+          wc -c report.md || true
+          echo "=== semgrep files listing ==="
+          ls -la semgrep-results.json semgrep-custom.json || true
+          echo "=== artifact dir preview ==="
+          find . -maxdepth 2 -type f -name 'report.md' -print || true
+
+      # Prepare a short/truncated summary to post (avoid very long issue body)
+      - name: Prepare short summary for posting
+        id: prepare_short
         run: |
           set -e
-          # prefer external report.md if present
+          # Ensure we have a small short file to post as issue/comment
+          SHORT_FILE=post_body_short.md
           if [ -f report.md ]; then
-            echo "Using report.md"
-            cp report.md post_body_full.md
+            # take first 400 lines and then truncate to MAX_POST_CHARS bytes
+            head -n 400 report.md > tmp_head.md || true
+            # truncate by bytes (may split utf-8 char, but acceptable for short summary)
+            dd if=tmp_head.md of=$SHORT_FILE bs=1 count=${{ env.MAX_POST_CHARS }} status=none || true
+            echo "Created $SHORT_FILE ($(wc -c < $SHORT_FILE || true) bytes)"
           else
-            echo "No report.md found: creating simple summary"
-            echo "# AI Security Review (요약)" > post_body_full.md
-            echo "" >> post_body_full.md
-            # Try to include first lines from semgrep results
-            if [ -f semgrep-results.json ]; then
-              echo "Semgrep findings preview:" >> post_body_full.md
-              jq -r '.results[] | "- " + (.path // .extra.metadata.file // "-") + ":" + ((.start.line // .start) | tostring) + " - " + (.extra.message // .message // "")' semgrep-results.json | sed -n '1,20p' >> post_body_full.md || true
-            fi
-            echo "" >> post_body_full.md
-            echo "_전체 리포트는 artifact로 보관됩니다._" >> post_body_full.md
+            echo "No report.md - creating minimal note" > $SHORT_FILE
+            echo "자동 리포트가 생성되지 않았습니다. 아티팩트를 확인하세요." >> $SHORT_FILE
           fi
+          echo "::notice::Prepared short summary for posting"
+          echo "post_size_bytes=$(wc -c < $SHORT_FILE || true)" >> $GITHUB_OUTPUT
 
-          # ensure file exists
-          touch post_body_full.md
-          # create truncated version
-          # Convert to single-line-safe for character count; but preserve newlines
-          total_chars=$(wc -c < post_body_full.md || echo 0)
-          echo "post_body_full.md bytes: $total_chars"
-          MAX=${MAX_POST_CHARS:-1800}
-          # If small, copy; else take first N chars safely
-          if [ "$total_chars" -le "$MAX" ]; then
-            echo "File within MAX_POST_CHARS ($MAX). Copying entire file."
-            cp post_body_full.md post_body.md
-          else
-            echo "Truncating to $MAX chars for post_body.md"
-            # use head by bytes (may split utf8 but acceptable for comment)
-            head -c $MAX post_body_full.md > post_body.md
-            echo "" >> post_body.md
-            echo "" >> post_body.md
-            echo "(리포트가 길어 요약만 표시되었습니다. 전체 리포트는 artifact로 확인하세요.)" >> post_body.md
-          fi
-
-          echo "=== post_body.md preview ==="
-          sed -n '1,60p' post_body.md || true
-          echo "=== end preview ==="
-          ls -la post_body.md || true
-
-      - name: Upload artifacts (report + semgrep results)
-        uses: actions/upload-artifact@v4
-        with:
-          name: security-scan-artifacts
-          path: |
-            semgrep-results.json
-            semgrep-custom.json
-            report.md
-            post_body_full.md
-            post_body.md
-            ai_summary_structured.json
-          if-no-files-found: ignore
-
-      - name: Post report (PR comment or create Issue) - unified
-        id: post_unified
+      - name: Post short summary (Issue on push, Comment on PR)  # always attempt
         uses: actions/github-script@v7
         with:
           script: |
             const fs = require('fs');
-            const path = 'post_body.md';
-            const body = fs.existsSync(path) ? fs.readFileSync(path,'utf8') : '자동 리포트가 생성되지 않았습니다.';
+            const shortPath = 'post_body_short.md';
+            const short = fs.existsSync(shortPath) ? fs.readFileSync(shortPath, 'utf8') : 'No report';
             const isPR = !!context.payload.pull_request;
-            const owner = context.repo.owner;
-            const repo = context.repo.repo;
-
+            const branchRef = context.ref || '(unknown)';
             try {
               if (isPR) {
-                const prNumber = context.payload.pull_request.number;
-                console.log(`Posting comment to PR #${prNumber}`);
-                const res = await github.rest.issues.createComment({
-                  owner,
-                  repo,
-                  issue_number: prNumber,
-                  body: `### 🤖 AI Security Review (자동 요약)\n\n${body}\n\n_전체 리포트는 Artifact로 업로드되었습니다._`
+                // Post comment on PR
+                await github.rest.issues.createComment({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: context.payload.pull_request.number,
+                  body: `### 🤖 AI Security Review (요약)\n\n${short}\n\n_전체 리포트는 artifact로 저장되어 있습니다._`
                 });
-                console.log("Posted PR comment id:", res.data && res.data.id);
+                console.log('Posted PR comment');
               } else {
-                console.log("No PR detected - creating Issue with summary");
-                const title = `[AI Security Scan] 자동 리포트 - ${new Date().toISOString().slice(0,10)}`;
-                const res = await github.rest.issues.create({
-                  owner,
-                  repo,
-                  title,
-                  body: `브랜치: ${context.ref}\n\n${body}\n\n_전체 리포트는 Artifact로 업로드되었습니다._`
+                // Create an issue on push
+                const title = `[AI Security Scan] 자동 리포트 - ${new Date().toISOString().slice(0,10)} (${branchRef})`;
+                const issue = await github.rest.issues.create({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  title: title,
+                  body: `브랜치: ${branchRef}\n\n### 요약\n\n${short}\n\n(전체 리포트는 artifact에 보관됩니다.)`
                 });
-                console.log("Created issue number:", res.data && res.data.number);
+                console.log('Created issue #' + issue.data.number);
               }
-            } catch (err) {
-              console.log("Error while posting:", err && (err.message || err));
-              // Write error to file for debugging
-              try {
-                fs.writeFileSync("post_error.log", String(err));
-              } catch (e) {}
-              throw err;
+            } catch (e) {
+              core && core.warning ? core.warning('Failed to post report: ' + e) : console.log('Failed to post report: ' + e);
+              // Don't fail the whole workflow - posting issues is best-effort
             }
 
-      - name: Final debug - list generated files
+      - name: Upload artifacts (report + supporting files)
+        uses: actions/upload-artifact@v4
+        with:
+          name: security-scan-artifacts
+          path: |
+            report.md
+            semgrep-results.json
+            semgrep-custom.json
+            post_body_short.md
+            files_to_analyze.json
+            files_content.json
+            heuristics.json
+            ai_summary_structured.json
+          if-no-files-found: ignore
+
+      - name: Final debug (list artifacts files before finish)
         run: |
-          echo "---- listing generated outputs for debug ----"
+          echo "Artifacts listed above were uploaded. Listing repo root for quick check:"
           ls -la || true
-          echo "---- show post_body.md (head) ----"
-          head -n 200 post_body.md || true
-          echo "---- show report.md (head) ----"
-          head -n 200 report.md || true
