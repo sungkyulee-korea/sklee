@@ -54,16 +54,20 @@ jobs:
             echo "no custom semgrep config"
           fi
 
+      # --- 안전한 방식: here-doc 대신 임시 파이썬 파일 생성 후 실행 ---
       - name: Run external security script (if present) or create fallback report
         id: run_external_or_fallback
         run: |
           ls -la .github/scripts || true
+
           if [ -f .github/scripts/security_scan.py ]; then
             echo "Running .github/scripts/security_scan.py (non-fatal)..."
             python .github/scripts/security_scan.py || echo "external script failed but continue"
           else
             echo "No external script - building fallback report.md from semgrep outputs"
-            python - <<'PY'
+
+            # create a small temporary Python script (no heredoc termination ambiguity)
+            cat > /tmp/gen_report.py <<'PYCODE'
 import json, os, sys
 results = []
 for fname in ("semgrep-custom.json","semgrep-results.json"):
@@ -102,7 +106,9 @@ with open("report.md", "w", encoding="utf8") as fw:
     fw.write("\n".join(lines))
 
 print("report.md created")
-PY
+PYCODE
+
+            python /tmp/gen_report.py || echo "gen_report.py failed"
           fi
 
       - name: Debug: show generated files and sizes
