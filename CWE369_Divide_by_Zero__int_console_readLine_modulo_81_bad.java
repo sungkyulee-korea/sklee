@@ -28,6 +28,7 @@ public class CWE369_Divide_by_Zero__int_console_readLine_modulo_81_bad extends C
         /* POTENTIAL FLAW: Zero modulus will cause an issue.  An integer division will
         result in an exception.  */
         IO.writeLine("100%" + data + " = " + (100 % data) + "\n");
+        
 
     }
 }
