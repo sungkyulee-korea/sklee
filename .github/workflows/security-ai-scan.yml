@@ -13,7 +13,6 @@ permissions:
   pull-requests: write
 
 env:
-  # 저장소 Secrets에 SKLEE_OPENAI_API_KEY로 OpenAI 키를 넣어두면 사용(선택)
   OPENAI_API_KEY: ${{ secrets.SKLEE_OPENAI_API_KEY }}
   MAX_POST_CHARS: "1800"
   MAX_FILES_TO_ANALYZE: "200"
@@ -42,7 +41,6 @@ jobs:
       - name: Run semgrep builtin
         id: run_semgrep_builtin
         run: |
-          echo "Running semgrep builtin rules..."
           semgrep --config p/ci --json --output semgrep-results.json || true
           ls -la semgrep-results.json || true
 
@@ -50,16 +48,14 @@ jobs:
         id: run_semgrep_custom
         run: |
           if [ -f .semgrep.yml ] || [ -f .semgrep.yaml ]; then
-            echo "Found custom semgrep config - running"
             semgrep --config .semgrep.yml --json --output semgrep-custom.json || true
             ls -la semgrep-custom.json || true
           else
-            echo "No custom semgrep config found - skipping"
+            echo "no custom semgrep config"
           fi
 
       - name: List .github/scripts
         run: |
-          echo "Listing .github/scripts (if present)"
           ls -la .github/scripts || true
 
       - name: Run external security script if present
@@ -69,26 +65,20 @@ jobs:
             echo "Running .github/scripts/security_scan.py"
             python .github/scripts/security_scan.py || echo "external script failed but continuing"
           else
-            echo "No external script found - creating a minimal fallback report.md"
+            echo "No external script found - creating fallback report.md"
             echo "# 간단 fallback 리포트" > report.md || true
             echo "" >> report.md
             echo "- No external script and no semgrep results processed." >> report.md || true
             echo "_전체 리포트는 artifact로 보관됩니다._" >> report.md || true
-            # also create a short post body
             head -n 50 report.md > post_body_short.md || true
           fi
 
       - name: Debug: show generated files and sizes
         run: |
-          echo "=== report.md preview ==="
           ls -la report.md || true
-          echo "size (bytes):"
           wc -c report.md || true
-          echo "=== post_body_short.md preview ==="
           ls -la post_body_short.md || true
-          echo "content (first 200 chars):"
           if [ -f post_body_short.md ]; then head -c 200 post_body_short.md || true; echo; fi
-          echo "=== semgrep outputs ==="
           ls -la semgrep-results.json semgrep-custom.json || true
 
       - name: Post result (PR comment or Issue)
@@ -98,27 +88,15 @@ jobs:
             const fs = require('fs');
             const shortPath = 'post_body_short.md';
             let body = null;
-
             if (fs.existsSync(shortPath)) {
-              try {
-                body = fs.readFileSync(shortPath, 'utf8');
-              } catch (e) {
-                body = null;
-              }
-            }
-
-            // fallback to full report if short not present
-            if (!body && fs.existsSync('report.md')) {
+              body = fs.readFileSync(shortPath, 'utf8');
+            } else if (fs.existsSync('report.md')) {
               body = fs.readFileSync('report.md', 'utf8').slice(0, 1800);
+            } else {
+              body = "자동 리포트가 생성되지 않았습니다. 아티팩트를 확인하세요.";
             }
-
-            if (!body) {
-              body = "자동 리포트가 생성되지 않았습니다. 아티팩트에서 report.md를 확인하세요.";
-            }
-
             const isPR = !!context.payload.pull_request;
             if (isPR) {
-              // Post as PR comment
               await github.rest.issues.createComment({
                 owner: context.repo.owner,
                 repo: context.repo.repo,
@@ -127,7 +105,6 @@ jobs:
               });
               console.log("Posted PR comment");
             } else {
-              // Create an issue on push
               await github.rest.issues.create({
                 owner: context.repo.owner,
                 repo: context.repo.repo,
