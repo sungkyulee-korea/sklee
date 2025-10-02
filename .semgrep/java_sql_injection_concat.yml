@@ -7,12 +7,15 @@ rules:
       cwe: "CWE-89"
       owasp: "Injection"
     pattern-either:
+      - pattern: $STMT.execute("..." + $X + ...)
+      - pattern: $STMT.executeQuery("..." + $X + ...)
+      - pattern: $STMT.executeUpdate("..." + $X + ...)
+      - pattern: $STMT.execute($X + "..." + ...)
+      - pattern: $STMT.executeQuery($X + "..." + ...)
+      - pattern: $STMT.executeUpdate($X + "..." + ...)
       - pattern: $STMT.execute($A + $B)
       - pattern: $STMT.executeQuery($A + $B)
       - pattern: $STMT.executeUpdate($A + $B)
-      - pattern: $STMT.execute($A + $B + $C)
-      - pattern: $STMT.executeQuery($A + $B + $C)
-      - pattern: $STMT.executeUpdate($A + $B + $C)
       - patterns:
           - pattern-inside: |
               $SQL = $A + $B;

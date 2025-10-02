@@ -12,17 +12,26 @@ rules:
           - pattern: $ST.executeUpdate($SQL)
           - pattern: $ST.execute($SQL)
 
+  - id: java-sqli-direct-concat
+    languages: [java]
+    message: "Possible SQL injection: String concatenation in execute() call. Use PreparedStatement with parameters."
+    severity: ERROR
+    pattern-either:
+      - pattern: $ST.execute("..." + $X + ...)
+      - pattern: $ST.executeQuery("..." + $X + ...)
+      - pattern: $ST.executeUpdate("..." + $X + ...)
+      - pattern: $ST.execute($X + "..." + ...)
+      - pattern: $ST.executeQuery($X + "..." + ...)
+      - pattern: $ST.executeUpdate($X + "..." + ...)
+
   - id: java-sqli-exec-with-plus
     languages: [java]
-    message: "Possible SQL injection: execute(...) called with string concatenation expression."
+    message: "Possible SQL injection: execute() called with string concatenation expression."
     severity: ERROR
     pattern-either:
       - pattern: $ST.executeQuery($A + $B)
       - pattern: $ST.executeUpdate($A + $B)
       - pattern: $ST.execute($A + $B)
-      - pattern: $ST.executeQuery($A + $B + $C)
-      - pattern: $ST.executeUpdate($A + $B + $C)
-      - pattern: $ST.execute($A + $B + $C)
 
   - id: java-sqli-stringbuilder
     languages: [java]
