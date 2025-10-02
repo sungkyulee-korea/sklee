@@ -1,10 +1,23 @@
 rules:
   - id: java-sql-injection-concat
-    patterns:
-      - pattern-regex: '\b\w+\.(execute|executeQuery|executeUpdate)\s*\([^)]*\+[^)]*\)'
-    message: "Possible SQL injection: SQL string is built using string concatenation and passed to execute(). Use PreparedStatement with parameters."
     languages: [java]
+    message: "Possible SQL injection: SQL string is built using string concatenation and passed to execute(). Use PreparedStatement with parameters."
     severity: ERROR
     metadata:
       cwe: "CWE-89"
       owasp: "Injection"
+    pattern-either:
+      - pattern: $STMT.execute($A + $B)
+      - pattern: $STMT.executeQuery($A + $B)
+      - pattern: $STMT.executeUpdate($A + $B)
+      - pattern: $STMT.execute($A + $B + $C)
+      - pattern: $STMT.executeQuery($A + $B + $C)
+      - pattern: $STMT.executeUpdate($A + $B + $C)
+      - patterns:
+          - pattern-inside: |
+              $SQL = $A + $B;
+              ...
+          - pattern-either:
+              - pattern: $STMT.execute($SQL)
+              - pattern: $STMT.executeQuery($SQL)
+              - pattern: $STMT.executeUpdate($SQL)

@@ -1,19 +1,25 @@
 rules:
   - id: java-sql-injection-statement
-    patterns:
-      - pattern-either:
-         - pattern: |
-             $S = $CONN.createStatement();
-             ...
-             $S.execute($SQL)
-         - pattern: |
-             Statement $S = $CONN.createStatement();
-             ...
-             $S.executeUpdate($SQL)
-      - pattern-regex: 'Statement\s+\w+\s*=\s*\w+\.createStatement\(\)'
-    message: "Possible SQL injection when using Statement + execute with dynamic SQL. Use PreparedStatement with parameter binding."
     languages: [java]
+    message: "Possible SQL injection when using Statement + execute with dynamic SQL. Use PreparedStatement with parameter binding."
     severity: ERROR
     metadata:
       cwe: "CWE-89"
       owasp: "Injection"
+    pattern-either:
+      - patterns:
+          - pattern-inside: |
+              Statement $S = $CONN.createStatement();
+              ...
+          - pattern-either:
+              - pattern: $S.execute($SQL)
+              - pattern: $S.executeQuery($SQL)
+              - pattern: $S.executeUpdate($SQL)
+      - patterns:
+          - pattern-inside: |
+              $S = $CONN.createStatement();
+              ...
+          - pattern-either:
+              - pattern: $S.execute($SQL)
+              - pattern: $S.executeQuery($SQL)
+              - pattern: $S.executeUpdate($SQL)

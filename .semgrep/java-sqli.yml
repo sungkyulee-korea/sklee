@@ -3,22 +3,49 @@ rules:
     languages: [java]
     message: "Possible SQL injection: concatenated SQL passed to executeQuery()/executeUpdate(). Use PreparedStatement."
     severity: ERROR
-    pattern: $ST.executeQuery($SQL)
-    pattern-inside: |
-      $SQL = $A + $B
+    patterns:
+      - pattern-inside: |
+          $SQL = $A + $B;
+          ...
+      - pattern-either:
+          - pattern: $ST.executeQuery($SQL)
+          - pattern: $ST.executeUpdate($SQL)
+          - pattern: $ST.execute($SQL)
 
   - id: java-sqli-exec-with-plus
     languages: [java]
     message: "Possible SQL injection: execute(...) called with string concatenation expression."
     severity: ERROR
-    pattern-regex: 'execute(Query|Update)?\s*\(\s*.*\+.*\)'
+    pattern-either:
+      - pattern: $ST.executeQuery($A + $B)
+      - pattern: $ST.executeUpdate($A + $B)
+      - pattern: $ST.execute($A + $B)
+      - pattern: $ST.executeQuery($A + $B + $C)
+      - pattern: $ST.executeUpdate($A + $B + $C)
+      - pattern: $ST.execute($A + $B + $C)
 
   - id: java-sqli-stringbuilder
     languages: [java]
     message: "Possible SQL injection: SQL assembled with StringBuilder then executed. Prefer parameterized queries."
     severity: ERROR
     patterns:
-      - pattern: StringBuilder $SB = new StringBuilder()
-      - pattern-either:
-          - pattern: $SB.append($X)
-      - pattern: $ST.executeQuery($SB.toString())
+      - pattern-inside: |
+          StringBuilder $SB = new StringBuilder(...);
+          ...
+      - pattern: $SB.append($X)
+      - pattern-inside: |
+          ...
+          $ST.executeQuery($SB.toString())
+      
+  - id: java-sqli-stringbuilder-update
+    languages: [java]
+    message: "Possible SQL injection: SQL assembled with StringBuilder then executed. Prefer parameterized queries."
+    severity: ERROR
+    patterns:
+      - pattern-inside: |
+          StringBuilder $SB = new StringBuilder(...);
+          ...
+      - pattern: $SB.append($X)
+      - pattern-inside: |
+          ...
+          $ST.executeUpdate($SB.toString())
