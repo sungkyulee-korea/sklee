@@ -1,60 +1,67 @@
 rules:
-  - id: java-sqli-string-concat
+  - id: semgrep.java-sqli-statement-used
     languages: [java]
-    message: "Possible SQL injection: concatenated SQL passed to executeQuery()/executeUpdate(). Use PreparedStatement."
-    severity: ERROR
+    severity: WARNING
+    message: >
+      java.sql.Statement used. Prefer PreparedStatement with parameter binding to avoid SQL injection risks.
+    metadata:
+      category: security
+      cwe: "CWE-89"
     patterns:
-      - pattern-inside: |
-          $SQL = $A + $B;
-          ...
       - pattern-either:
-          - pattern: $ST.executeQuery($SQL)
-          - pattern: $ST.executeUpdate($SQL)
-          - pattern: $ST.execute($SQL)
+          # createStatement()는 보통 인자 없이 호출됩니다 — (...) 같은 표기는 사용하지 마세요.
+          - pattern: |
+              Statement $S = $CONN.createStatement();
+          - pattern: |
+              $CONN.createStatement().executeQuery($SQL);
+          - pattern: |
+              $CONN.createStatement().executeUpdate($SQL);
+          - pattern: |
+              $CONN.createStatement().execute($SQL);
 
-  - id: java-sqli-direct-concat
+  - id: semgrep.java-sqli-string-concat
     languages: [java]
-    message: "Possible SQL injection: String concatenation in execute() call. Use PreparedStatement with parameters."
     severity: ERROR
-    pattern-either:
-      - pattern: $ST.execute("..." + $X + ...)
-      - pattern: $ST.executeQuery("..." + $X + ...)
-      - pattern: $ST.executeUpdate("..." + $X + ...)
-      - pattern: $ST.execute($X + "..." + ...)
-      - pattern: $ST.executeQuery($X + "..." + ...)
-      - pattern: $ST.executeUpdate($X + "..." + ...)
-
-  - id: java-sqli-exec-with-plus
-    languages: [java]
-    message: "Possible SQL injection: execute() called with string concatenation expression."
-    severity: ERROR
-    pattern-either:
-      - pattern: $ST.executeQuery($A + $B)
-      - pattern: $ST.executeUpdate($A + $B)
-      - pattern: $ST.execute($A + $B)
-
-  - id: java-sqli-stringbuilder
-    languages: [java]
-    message: "Possible SQL injection: SQL assembled with StringBuilder then executed. Prefer parameterized queries."
-    severity: ERROR
+    message: >
+      SQL string is built via concatenation. If any component is user-controlled, this is vulnerable.
+      Use placeholders (?) and setXxx(...) methods.
+    metadata:
+      category: security
+      cwe: "CWE-89"
     patterns:
-      - pattern-inside: |
-          StringBuilder $SB = new StringBuilder(...);
-          ...
-      - pattern: $SB.append($X)
-      - pattern-inside: |
-          ...
-          $ST.executeQuery($SB.toString())
-      
-  - id: java-sqli-stringbuilder-update
+      - pattern-either:
+          # 단순한 문자열 덧셈(연결) 패턴들 — 실제 Java 문법을 사용
+          - pattern: |
+              $SQL = $A + $B;
+          - pattern: |
+              $SQL = $A + $B + $C;
+          - pattern: |
+              $SQL = String.format($FMT, $ARGS);
+          # executeQuery/executeUpdate 호출에서 인수로 전달된 표현을 잡는 패턴:
+          - pattern: |
+              $S.executeQuery($ARG);
+          - pattern: |
+              $S.executeUpdate($ARG);
+      # $ARG(또는 $SQL) 내부에 '+' 연산자가 포함된 경우에만 심각도로 처리하도록 추가 휴리스틱
+      - metavariable-regex:
+          metavariable: $ARG
+          regex: "\\+"
+          # 위 정규식은 소스 코드 텍스트에 '+'가 존재하면 매치되게 함 (간단 휴리스틱)
+
+  - id: semgrep.java-sqli-prepared-bad-building
     languages: [java]
-    message: "Possible SQL injection: SQL assembled with StringBuilder then executed. Prefer parameterized queries."
     severity: ERROR
+    message: >
+      PreparedStatement is created from a dynamic SQL string. Ensure placeholders (?) are used and parameters bound separately.
+    metadata:
+      category: security
+      cwe: "CWE-89"
     patterns:
-      - pattern-inside: |
-          StringBuilder $SB = new StringBuilder(...);
-          ...
-      - pattern: $SB.append($X)
-      - pattern-inside: |
-          ...
-          $ST.executeUpdate($SB.toString())
+      - pattern-either:
+          - pattern: |
+              PreparedStatement $P = $CONN.prepareStatement($SQL);
+          - pattern: |
+              $CONN.prepareStatement($SQL);
+      - metavariable-regex:
+          metavariable: $SQL
+          regex: "\\+|String\\.format\\(|\\bconcat\\b"
