@@ -1,0 +1,13 @@
+{
+  "name": "openai-security-scan",
+  "version": "1.0.0",
+  "description": "GitHub Action script for vulnerability analysis using OpenAI",
+  "main": "analyze.js",
+  "type": "module",
+  "scripts": {
+    "start": "node analyze.js"
+  },
+  "dependencies": {
+    "@octokit/rest": "^20.0.0"
+  }
+}
