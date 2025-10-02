@@ -23,6 +23,7 @@ import java.io.*;
 
 import java.sql.*;
 
+
 public class CWE259_Hard_Coded_Password__driverManager_81_bad extends CWE259_Hard_Coded_Password__driverManager_81_base
 {
     public void action(String data ) throws Throwable
