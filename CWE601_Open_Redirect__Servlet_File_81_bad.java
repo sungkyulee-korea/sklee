@@ -14,6 +14,7 @@ Template File: sources-sink-81_bad.tmpl.java
  *
  * */
 
+
 package testcases.CWE601_Open_Redirect;
 
 import testcasesupport.*;
