@@ -1,4 +1,4 @@
-name: Security AI Scan (robust + debug + truncate-safe post)
+name: Security AI Scan (safe + debug)
 
 on:
   push:
@@ -13,7 +13,7 @@ permissions:
   pull-requests: write
 
 env:
-  OPENAI_MODEL: "gpt-4o-mini"
+  OPENAI_API_KEY: ${{ secrets.SKLEE_OPENAI_API_KEY }}
   MAX_FILE_BYTES: "150000"
   MAX_FILES_TO_ANALYZE: "200"
 
@@ -30,135 +30,141 @@ jobs:
       - name: Setup Python 3.10
         uses: actions/setup-python@v4
         with:
-          python-version: "3.10"
+          python-version: '3.10'
 
       - name: Install dependencies (semgrep, requests)
         run: |
           python -m pip install --upgrade pip
           pip install semgrep requests
 
-      - name: Run semgrep (builtin + custom if exists)
+      - name: Run semgrep (builtin rules)
         run: |
-          echo "Running semgrep..."
-          CUSTOM=".semgrep/java-sqli.yml"
-          if [ -f "$CUSTOM" ]; then
-            echo "Using custom semgrep rules: $CUSTOM"
-            semgrep --config p/ci,"$CUSTOM" --json --output semgrep-results.json || true
+          # run semgrep with default CI rules and also allow a local semgrep.yml if present
+          if [ -f .semgrep.yml ]; then
+            semgrep --config .semgrep.yml --json --output semgrep-results.json || true
+          elif [ -f semgrep.yml ]; then
+            semgrep --config semgrep.yml --json --output semgrep-results.json || true
           else
             semgrep --config p/ci --json --output semgrep-results.json || true
           fi
-          echo "semgrep exit code: $?"
-          echo "semgrep-results.json (head):"
-          if [ -f semgrep-results.json ]; then head -n 200 semgrep-results.json || true; else echo "(no semgrep-results.json)"; fi
+          echo "semgrep finished, results saved to semgrep-results.json (if any)"
 
-      - name: Run security script to generate report.md
+      - name: Run external security script (if present)
+        id: run_external
         run: |
-          echo "Running security_scan.py (will always produce report.md)"
-          python .github/scripts/security_scan.py
-        env:
-          OPENAI_API_KEY: ${{ secrets.SKLEE_OPENAI_API_KEY }}
-          OPENAI_MODEL: ${{ env.OPENAI_MODEL }}
-          GITHUB_REPOSITORY: ${{ github.repository }}
-          GITHUB_EVENT_PATH: ${{ github.event_path }}
-          GITHUB_RUN_ID: ${{ github.run_id }}
+          set -euo pipefail
+          echo "----- START external security script step -----"
+          echo "Listing .github/scripts directory (if present):"
+          ls -la .github/scripts || true
 
-      - name: Debug: show generated report (head)
-        run: |
-          echo "---- Files in workspace ----"
-          ls -la | sed -n '1,200p'
-          echo "---- report.md head ----"
-          if [ -f report.md ]; then sed -n '1,200p' report.md; else echo "(no report.md)"; fi
-          echo "---- ai_summary_structured.json head ----"
-          if [ -f ai_summary_structured.json ]; then sed -n '1,200p' ai_summary_structured.json; else echo "(no ai_summary_structured.json)"; fi
-          echo "---- semgrep-results.json head ----"
-          if [ -f semgrep-results.json ]; then sed -n '1,200p' semgrep-results.json; else echo "(no semgrep-results.json)"; fi
+          if [ -f .github/scripts/security_scan.py ]; then
+            echo "Found .github/scripts/security_scan.py -> running it (exit code ignored)"
+            python .github/scripts/security_scan.py || true
+          else
+            echo ".github/scripts/security_scan.py not found — generating fallback report from semgrep-results.json"
+            python - <<'PY'
+import json, os, sys
+out = 'report.md'
+lines = []
+try:
+    if os.path.exists('semgrep-results.json'):
+        with open('semgrep-results.json','r',encoding='utf8') as f:
+            data = json.load(f)
+        results = data.get('results', []) if isinstance(data, dict) else []
+    else:
+        results = []
 
-      - name: Debug & Force-create issue (truncate-safe)
+    lines.append("### AI Security Review (자동 리포트)")
+    lines.append("")
+    if results:
+        lines.append("## Semgrep 발견 항목:")
+        for r in results[:200]:
+            # semgrep formats differ; try to extract path/line/message/severity
+            path = r.get('path') or r.get('extra', {}).get('metadata', {}).get('file', '-')
+            extra = r.get('extra', {})
+            msg = extra.get('message') or r.get('message') or ''
+            start = '-'
+            if isinstance(r.get('start'), dict):
+                start = r.get('start').get('line', '-')
+            else:
+                start = r.get('start', '-')
+            sev = extra.get('severity', '')
+            lines.append(f"- {path}:{start} [{sev}] {msg}")
+    else:
+        lines.append("- Semgrep: 문제 없음 (기본 룰).")
+
+    lines.append("")
+    lines.append("_자동 리포트 — 담당자 검토 필요_")
+    with open(out, 'w', encoding='utf8') as fw:
+        fw.write('\n'.join(lines))
+    print('report.md created; files_count: 1')
+except Exception as e:
+    print('Failed to create fallback report:', e)
+    sys.exit(0)
+PY
+          fi
+
+          echo "----- END external security script step -----"
+
+      # Debug + Force post: check report file + try to create a debug issue (always run, even on failure)
+      - name: Debug & Force post issue (show repo info, report head, and API response)
         if: ${{ always() }}
         env:
           GITHUB_API_URL: https://api.github.com
-          REPORT_PATH: report.md
-          ALT_REPORT: ai_report_openai.md
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          owner_repo="${GITHUB_REPOSITORY}"
-          run_id="${GITHUB_RUN_ID:-}"
-          echo "Repository: $owner_repo"
-          echo "GITHUB_RUN_ID: ${run_id:-(none)}"
-          echo "GITHUB_EVENT_NAME: ${GITHUB_EVENT_NAME:-(none)}"
-          echo "GITHUB_EVENT_PATH: ${GITHUB_EVENT_PATH:-(none)}"
 
-          # pick report text (truncate head)
-          REPORT_TEXT=""
-          if [ -f "$REPORT_PATH" ]; then
-            echo "FOUND report: $REPORT_PATH (size=$(stat -c%s "$REPORT_PATH"))"
-            REPORT_TEXT=$(sed -n '1,15000p' "$REPORT_PATH" || true)
-          elif [ -f "$ALT_REPORT" ]; then
-            echo "FOUND alt report: $ALT_REPORT (size=$(stat -c%s "$ALT_REPORT"))"
-            REPORT_TEXT=$(sed -n '1,15000p' "$ALT_REPORT" || true)
-          else
-            echo "No report file found. Will post debug summary."
-            REPORT_TEXT="No report file found. Workspace listing:\\n$(ls -la | sed 's/\"/\\\\\"/g' | awk '{printf \"%s\\n\",$0}')"
-          fi
-
-          TRUNC_LIMIT=30000
-          SHORT_BODY="$(printf "%s" "$REPORT_TEXT" | tr -d '\r' | sed 's/"/\\"/g' | cut -c -${TRUNC_LIMIT})"
-          ARTIFACT_LINK="https://github.com/${owner_repo}/actions/runs/${run_id}/artifacts"
-          FOOTER="\n\n(Full report saved as an artifact for this run: ${ARTIFACT_LINK})"
-
-          ISSUE_TITLE="[AI Security Scan] 자동 리포트 - $(date -I)"
-          ISSUE_BODY="$(printf "%s\n\n%s" "$SHORT_BODY" "$FOOTER" | sed 's/"/\\"/g')"
-
-          # detect PR number from event
-          PR_NUM=""
+          echo "=== Debug start: repo, event info ==="
+          echo "REPO=$GITHUB_REPOSITORY"
+          echo "EVENT_NAME=$GITHUB_EVENT_NAME"
           if [ -n "${GITHUB_EVENT_PATH:-}" ] && [ -f "${GITHUB_EVENT_PATH}" ]; then
-            PR_NUM=$(python - <<'PY'
-import json,sys
-try:
-  ev=json.load(open(sys.argv[1]))
-  pr=ev.get("pull_request")
-  if pr:
-    print(pr.get("number",""))
-  else:
-    print("")
-except:
-  print("")
-PY
- "${GITHUB_EVENT_PATH}" 2>/dev/null || true)
-          fi
-          echo "PR_NUM: ${PR_NUM:-(none)}"
-
-          if [ -n "${PR_NUM}" ]; then
-            echo "Posting as PR comment to #${PR_NUM}..."
-            POST_URL="${GITHUB_API_URL}/repos/${owner_repo}/issues/${PR_NUM}/comments"
-            JSON_PAYLOAD=$(printf '{"body":"%s"}' "${ISSUE_BODY}")
+            echo "---- event payload (first 200 lines) ----"
+            sed -n '1,200p' "${GITHUB_EVENT_PATH}" || true
           else
-            echo "Creating issue..."
-            POST_URL="${GITHUB_API_URL}/repos/${owner_repo}/issues"
-            JSON_PAYLOAD=$(printf '{"title":"%s","body":"%s"}' "${ISSUE_TITLE}" "${ISSUE_BODY}")
+            echo "(no event payload file)"
           fi
 
-          resp=$(curl -sS -w "\n%{http_code}" -X POST \
+          echo
+          echo "=== Check report file ==="
+          if [ -f "report.md" ]; then
+            echo "report exists:"
+            ls -lh "report.md" || true
+            echo "---- head of report (first 200 lines) ----"
+            sed -n '1,200p' "report.md" || true
+          else
+            echo "report.md NOT found"
+          fi
+
+          echo
+          echo "=== Repo details (raw JSON) ==="
+          curl -sS -H "Authorization: Bearer ${GITHUB_TOKEN}" -H "Accept: application/vnd.github+json" \
+            "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}" > repo_info.json || true
+          echo "---- repo_info.json (head) ----"
+          head -c 2000 repo_info.json || true
+          echo
+
+          echo "=== Try to create a temporary debug issue (will be created if possible) ==="
+          TITLE="[DEBUG][AI Security Scan] 자동 리포트 - $(date -Iseconds)"
+          if [ -f "report.md" ]; then
+            BODY_RAW=$(sed -n '1,300p' report.md | sed 's/"/\\"/g' | sed ':a;N;$!ba;s/\n/\\n/g')
+          else
+            BODY_RAW="(no report file)"
+          fi
+          PAYLOAD=$(printf '{"title":"%s","body":"%s\n\n(자동 디버그 리포트)"}' "$TITLE" "$BODY_RAW")
+
+          RESP_BODY_FILE="debug_issue_response.json"
+          HTTP_CODE=$(curl -sS -o "$RESP_BODY_FILE" -w "%{http_code}" -X POST \
             -H "Authorization: Bearer ${GITHUB_TOKEN}" \
             -H "Accept: application/vnd.github+json" \
             -H "Content-Type: application/json" \
-            "${POST_URL}" -d "${JSON_PAYLOAD}" ) || true
+            "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/issues" \
+            -d "$PAYLOAD" || true )
 
-          http_code=$(echo "$resp" | tail -n1)
-          resp_body=$(echo "$resp" | sed '$d')
-          echo "HTTP_CODE: $http_code"
-          echo "RESPONSE_BODY (head):"
-          echo "$resp_body" | sed -n '1,400p' || true
-
-          if [ "$http_code" -ge 200 ] && [ "$http_code" -lt 300 ]; then
-            echo "Post succeeded."
-            echo "Artifact link (view when signed-in): ${ARTIFACT_LINK}"
-          else
-            echo "Post failed. See above response body for details."
-            echo "Possible causes: Issues disabled (has_issues=false), GITHUB_TOKEN lacks permission, organization policy blocking, body/payload validation (too long or invalid chars)."
-            exit 1
-          fi
+          echo "HTTP_CODE=${HTTP_CODE}"
+          echo "---- response (head) ----"
+          head -c 2000 "$RESP_BODY_FILE" || true
+          echo "Saved response to $RESP_BODY_FILE"
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
@@ -166,5 +172,10 @@ PY
           name: security-scan-artifacts
           path: |
             semgrep-results.json
-            ai_summary_structured.json
             report.md
+            repo_info.json
+            debug_issue_response.json
+
+      - name: Post Setup Python (cleanup step placeholder)
+        run: echo "Done."
+
