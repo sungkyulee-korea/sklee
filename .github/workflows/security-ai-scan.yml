@@ -1,4 +1,4 @@
-name: Security AI Scan (safe + detailed)
+name: Security AI Scan (robust + debug)
 
 on:
   push:
@@ -13,8 +13,7 @@ permissions:
   pull-requests: write
 
 env:
-  # 저장소에 등록한 시크릿 이름과 동일하게 설정하세요
-  OPENAI_API_KEY: ${{ secrets.SKLEE_OPENAI_API_KEY }}
+  OPENAI_MODEL: "gpt-4o-mini"
   MAX_FILE_BYTES: "150000"
   MAX_FILES_TO_ANALYZE: "200"
 
@@ -31,97 +30,115 @@ jobs:
       - name: Setup Python 3.10
         uses: actions/setup-python@v4
         with:
-          python-version: '3.10'
+          python-version: "3.10"
 
       - name: Install dependencies (semgrep, requests)
         run: |
           python -m pip install --upgrade pip
           pip install semgrep requests
 
-      - name: Run semgrep (builtin rules + custom rules)
+      - name: Run semgrep (builtin + custom if exists)
         run: |
-          echo "Running semgrep with builtin p/ci and custom rules (if exist)"
-          # custom rules file path (repo에 추가한 경우)
-          CUSTOM_RULES=".semgrep/java-sqli.yml"
-          if [ -f "$CUSTOM_RULES" ]; then
-            semgrep --config p/ci,"$CUSTOM_RULES" --json --output semgrep-results.json || true
+          echo "Running semgrep..."
+          CUSTOM=".semgrep/java-sqli.yml"
+          if [ -f "$CUSTOM" ]; then
+            echo "Using custom semgrep rules: $CUSTOM"
+            semgrep --config p/ci,"$CUSTOM" --json --output semgrep-results.json || true
           else
             semgrep --config p/ci --json --output semgrep-results.json || true
           fi
-          echo "semgrep exit: $?"
-          echo "semgrep results head (if exists):"
-          if [ -f semgrep-results.json ]; then head -n 200 semgrep-results.json || true; else echo "no semgrep-results.json"; fi
+          echo "semgrep exit code: $?"
+          echo "semgrep-results.json (head):"
+          if [ -f semgrep-results.json ]; then head -n 200 semgrep-results.json || true; else echo "(no semgrep-results.json)"; fi
 
-      - name: Debug: list workspace top & git status
+      - name: Run security script to generate report.md
         run: |
-          echo "=== top-level files ==="
-          ls -la | sed -n '1,200p'
-          echo "=== .github/scripts listing ==="
-          ls -la .github/scripts || true
-          echo "=== git status ==="
-          git rev-parse --abbrev-ref HEAD || true
-          git status --porcelain || true
-
-      - name: Run external security script (generate report files)
-        run: |
-          echo "Run security script (will always produce report.md even if no findings)"
+          echo "Running security_scan.py (will always produce report.md)"
           python .github/scripts/security_scan.py
         env:
           OPENAI_API_KEY: ${{ secrets.SKLEE_OPENAI_API_KEY }}
-          GITHUB_REF: ${{ github.ref }}
-          GITHUB_SHA: ${{ github.sha }}
-          GITHUB_ACTOR: ${{ github.actor }}
+          OPENAI_MODEL: ${{ env.OPENAI_MODEL }}
           GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_EVENT_PATH: ${{ github.event_path }}
 
-      - name: Debug: show generated reports
+      - name: Debug: show generated report (head)
         run: |
-          echo "---- report.md ----"
-          if [ -f report.md ]; then
-            echo "report.md size: $(stat -c%s report.md)"; sed -n '1,200p' report.md
-          else
-            echo "report.md missing"
-          fi
-          echo "---- ai_summary_structured.json ----"
-          if [ -f ai_summary_structured.json ]; then head -n 200 ai_summary_structured.json || true; else echo "ai_summary_structured.json missing"; fi
-          echo "---- semgrep-results.json ----"
-          if [ -f semgrep-results.json ]; then head -n 200 semgrep-results.json || true; else echo "semgrep-results.json missing"; fi
+          echo "---- Files in workspace ----"
+          ls -la | sed -n '1,200p'
+          echo "---- report.md head ----"
+          if [ -f report.md ]; then sed -n '1,200p' report.md; else echo "(no report.md)"; fi
+          echo "---- ai_summary_structured.json head ----"
+          if [ -f ai_summary_structured.json ]; then sed -n '1,200p' ai_summary_structured.json; else echo "(no ai_summary_structured.json)"; fi
+          echo "---- semgrep-results.json head ----"
+          if [ -f semgrep-results.json ]; then sed -n '1,200p' semgrep-results.json; else echo "(no semgrep-results.json)"; fi
 
-      - name: Post result (PR comment or create Issue)  # 항상 시도
+      - name: Debug & Force-create issue (detailed)
         if: ${{ always() }}
-        uses: actions/github-script@v7
-        with:
-          script: |
-            const fs = require('fs');
-            let body = '';
-            if (fs.existsSync('report.md')) {
-              body = fs.readFileSync('report.md','utf8');
-            } else {
-              body = 'No report.md was generated.\n\n';
-              body += 'Workspace files (top):\n' + fs.readdirSync('.').slice(0,200).join('\n') + '\n\n';
-              if (fs.existsSync('semgrep-results.json')) {
-                body += 'semgrep-results.json present but report.md missing. semgrep head:\n';
-                body += fs.readFileSync('semgrep-results.json','utf8').slice(0,2000);
-              } else {
-                body += 'semgrep-results.json not present.\n';
-              }
-            }
+        env:
+          GITHUB_API_URL: https://api.github.com
+          REPORT_PATH: report.md
+          ALT_REPORT: ai_report_openai.md
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          owner_repo="${GITHUB_REPOSITORY}"
+          echo "Repository: $owner_repo"
+          echo "GITHUB_EVENT_NAME: ${GITHUB_EVENT_NAME:-(none)}"
+          echo "GITHUB_EVENT_PATH: ${GITHUB_EVENT_PATH:-(none)}"
 
-            const isPR = !!context.payload.pull_request;
-            if (isPR) {
-              await github.rest.issues.createComment({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                issue_number: context.payload.pull_request.number,
-                body: `### 🤖 AI Security Review (자동 리포트)\n\n${body}\n\n_자동 생성 — 담당자 검토 필요_`
-              });
-            } else {
-              await github.rest.issues.create({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                title: `[AI Security Scan] 자동 리포트 - ${new Date().toISOString().slice(0,10)}`,
-                body: `브랜치: ${context.ref}\n\n${body}\n\n_자동 생성 리포트_`
-              });
-            }
+          # pick report body
+          if [ -f "$REPORT_PATH" ]; then
+            echo "FOUND report: $REPORT_PATH (size=$(stat -c%s "$REPORT_PATH"))"
+            report_body=$(sed -n '1,1000p' "$REPORT_PATH" | sed 's/"/\\"/g' | awk '{printf "%s\\n",$0}')
+          elif [ -f "$ALT_REPORT" ]; then
+            echo "FOUND alt report: $ALT_REPORT (size=$(stat -c%s "$ALT_REPORT"))"
+            report_body=$(sed -n '1,1000p' "$ALT_REPORT" | sed 's/"/\\"/g' | awk '{printf "%s\\n",$0}')
+          else
+            echo "No report file found. Will post debug summary."
+            report_body="No report file found. Workspace listing:\\n$(ls -la | sed 's/\"/\\\\\"/g' | awk '{printf \"%s\\n\",$0}')"
+          fi
+
+          echo "== Checking repository metadata (has_issues) =="
+          repo_resp=$(curl -sS -H "Authorization: Bearer ${GITHUB_TOKEN}" -H "Accept: application/vnd.github+json" "${GITHUB_API_URL}/repos/${owner_repo}")
+          echo "Repo metadata (truncated):"
+          echo "${repo_resp}" | sed -n '1,200p' || true
+          has_issues=$(echo "${repo_resp}" | python -c "import sys,json;print(json.load(sys.stdin).get('has_issues'))" || echo "unknown")
+          echo "has_issues: ${has_issues}"
+
+          # determine if this is a PR event
+          PR_NUM=""
+          if [ -n "${GITHUB_EVENT_PATH:-}" ] && [ -f "${GITHUB_EVENT_PATH}" ]; then
+            PR_NUM=$(python -c "import json,sys; j=json.load(open(sys.argv[1])); pr=j.get('pull_request',{}); print(pr.get('number',''))" "${GITHUB_EVENT_PATH}" 2>/dev/null || true)
+          fi
+          echo "PR_NUM: ${PR_NUM:-(none)}"
+
+          # prepare payload
+          ISSUE_TITLE="[DEBUG][AI Security Scan] 자동 리포트 - $(date -I)"
+          BODY_JSON=$(printf '{"title":"%s","body":"%s"}' "${ISSUE_TITLE}" "${report_body}")
+
+          if [ -n "${PR_NUM}" ]; then
+            echo "Posting as PR comment to issue number ${PR_NUM}"
+            POST_URL="${GITHUB_API_URL}/repos/${owner_repo}/issues/${PR_NUM}/comments"
+            resp=$(curl -sS -w "\n%{http_code}" -X POST -H "Authorization: Bearer ${GITHUB_TOKEN}" -H "Accept: application/vnd.github+json" -H "Content-Type: application/json" "${POST_URL}" -d "$(printf '{"body":"%s"}' "${report_body}")" ) || true
+          else
+            echo "Creating Issue"
+            POST_URL="${GITHUB_API_URL}/repos/${owner_repo}/issues"
+            resp=$(curl -sS -w "\n%{http_code}" -X POST -H "Authorization: Bearer ${GITHUB_TOKEN}" -H "Accept: application/vnd.github+json" -H "Content-Type: application/json" "${POST_URL}" -d "${BODY_JSON}" ) || true
+          fi
+
+          http_code=$(echo "$resp" | tail -n1)
+          resp_body=$(echo "$resp" | sed '$d')
+          echo "HTTP_CODE: $http_code"
+          echo "RESPONSE_BODY (head):"
+          echo "$resp_body" | sed -n '1,400p' || true
+
+          if [ "$http_code" -ge 200 ] && [ "$http_code" -lt 300 ]; then
+            echo "Post succeeded."
+          else
+            echo "Post failed. See above response_body for reason."
+            echo "Possible causes: Issues disabled, GITHUB_TOKEN lacks permission, organization policy blocking, payload invalid."
+            exit 1
+          fi
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
@@ -130,7 +147,4 @@ jobs:
           path: |
             semgrep-results.json
             ai_summary_structured.json
-            files_to_analyze.json
-            files_content.json
-            heuristics.json
             report.md
